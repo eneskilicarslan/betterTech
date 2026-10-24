@@ -104,6 +104,9 @@ pub fn discover(api: &HidApi) -> Result<Vec<DeviceDescriptor>> {
             .flat_map(|handle| handle.join().unwrap_or_default())
             .collect::<Vec<_>>()
     });
+    // Deduplicate any repeated responses on same unit_id (e.g. bluetooth virtual slots)
+    devices.sort_by(|a, b| a.product_id.cmp(&b.product_id).then_with(|| a.unit_id.cmp(&b.unit_id)));
+    devices.dedup_by(|a, b| a.product_id == b.product_id && a.unit_id == b.unit_id && !a.unit_id.is_empty());
     devices.sort_by_key(|a| a.name.to_lowercase());
     Ok(devices)
 }
@@ -116,7 +119,7 @@ fn scan_path(path: &str) -> Vec<DeviceDescriptor> {
         return Vec::new();
     };
     let mut devices = Vec::new();
-    for index in 1..=3u8 {
+    for index in 1..=6u8 {
         transport.set_device_index(index);
         if let Ok(Some(mut device)) = probe(&transport, index) {
             device.path = path.to_owned();
@@ -124,13 +127,6 @@ fn scan_path(path: &str) -> Vec<DeviceDescriptor> {
         }
     }
     if devices.is_empty() {
-        for index in 4..=6u8 {
-            transport.set_device_index(index);
-            if let Ok(Some(mut device)) = probe(&transport, index) {
-                device.path = path.to_owned();
-                devices.push(device);
-            }
-        }
         transport.set_device_index(0xff);
         if let Ok(Some(mut device)) = probe(&transport, 0xff) {
             device.path = path.to_owned();
@@ -142,7 +138,7 @@ fn scan_path(path: &str) -> Vec<DeviceDescriptor> {
 
 fn probe(transport: &Transport, index: u8) -> Result<Option<DeviceDescriptor>> {
     if transport
-        .get_feature_with_timeout(0x0003, Duration::from_millis(200))?
+        .get_feature_with_timeout(0x0003, Duration::from_millis(450))?
         .is_none()
     {
         return Ok(None);
@@ -153,7 +149,7 @@ fn probe(transport: &Transport, index: u8) -> Result<Option<DeviceDescriptor>> {
     let info = transport.device_info()?;
     let mut features = transport.feature_set()?;
     if features.is_empty() {
-        sleep(Duration::from_millis(30));
+        sleep(Duration::from_millis(50));
         features = transport.feature_set()?;
     }
     Ok(Some(DeviceDescriptor {

@@ -58,7 +58,7 @@ impl Transport {
         feature_id: u16,
         timeout: Duration,
     ) -> Result<Option<Feature>> {
-        let reply = self.request_with_timeout(0x00, 0x00, &feature_id.to_be_bytes(), timeout, 1)?;
+        let reply = self.request_with_timeout(0x00, 0x00, &feature_id.to_be_bytes(), timeout, 2)?;
         Ok(reply
             .and_then(|payload| payload.first().copied())
             .filter(|index| *index != 0)
@@ -670,7 +670,7 @@ impl Transport {
             feature_index,
             function,
             params,
-            Duration::from_millis(250),
+            Duration::from_millis(450),
             2,
         )
     }
