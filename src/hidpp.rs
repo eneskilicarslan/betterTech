@@ -1144,7 +1144,7 @@ pub fn parse_mouse_binding(raw: [u8; 4]) -> (String, String) {
     }
 }
 
-fn hid_keycode_name(key: u8) -> String {
+pub fn hid_keycode_name(key: u8) -> String {
     match key {
         0x04..=0x1D => {
             let ch = (b'A' + (key - 0x04)) as char;
@@ -1160,8 +1160,29 @@ fn hid_keycode_name(key: u8) -> String {
         0x2A => "Backspace".into(),
         0x2B => "Tab".into(),
         0x2C => "Space".into(),
-        0x4C => "Delete".into(),
+        0x2D => "-".into(),
+        0x2E => "=".into(),
+        0x2F => "[".into(),
+        0x30 => "]".into(),
+        0x31 => "\\".into(),
+        0x33 => ";".into(),
+        0x34 => "'".into(),
+        0x35 => "`".into(),
+        0x36 => ",".into(),
+        0x37 => ".".into(),
+        0x38 => "/".into(),
+        0x39 => "Caps Lock".into(),
         0x3A..=0x45 => format!("F{}", key - 0x39),
+        0x49 => "Insert".into(),
+        0x4A => "Home".into(),
+        0x4B => "Page Up".into(),
+        0x4C => "Delete".into(),
+        0x4D => "End".into(),
+        0x4E => "Page Down".into(),
+        0x4F => "Right Arrow".into(),
+        0x50 => "Left Arrow".into(),
+        0x51 => "Down Arrow".into(),
+        0x52 => "Up Arrow".into(),
         other => format!("Key 0x{other:02X}"),
     }
 }

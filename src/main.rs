@@ -926,38 +926,112 @@ fn parse_backlight_effect(name: &str) -> Option<u8> {
     }
 }
 
-fn parse_mouse_action_preset(s: &str) -> Result<[u8; 4]> {
-    let lower = s.to_lowercase().replace('_', "-").replace(' ', "-");
-    match lower.as_str() {
-        "left" | "left-click" => Ok([0x80, 0x01, 0x00, 0x01]),
-        "right" | "right-click" => Ok([0x80, 0x01, 0x00, 0x02]),
-        "middle" | "middle-click" | "wheel" => Ok([0x80, 0x01, 0x00, 0x04]),
-        "back" | "side-1" => Ok([0x80, 0x01, 0x00, 0x08]),
-        "forward" | "side-2" => Ok([0x80, 0x01, 0x00, 0x10]),
-        "dpi-cycle" | "dpi" => Ok([0x90, 0x05, 0x00, 0x00]),
-        "dpi-up" => Ok([0x90, 0x03, 0x00, 0x00]),
-        "dpi-down" => Ok([0x90, 0x04, 0x00, 0x00]),
-        "dpi-default" => Ok([0x90, 0x06, 0x00, 0x00]),
-        "dpi-shift" | "sniper" => Ok([0x90, 0x07, 0x00, 0x00]),
-        "copy" | "ctrl-c" => Ok([0x80, 0x02, 0x01, 0x06]),
-        "paste" | "ctrl-v" => Ok([0x80, 0x02, 0x01, 0x19]),
-        "cut" | "ctrl-x" => Ok([0x80, 0x02, 0x01, 0x1B]),
-        "undo" | "ctrl-z" => Ok([0x80, 0x02, 0x01, 0x1D]),
-        "redo" | "ctrl-y" => Ok([0x80, 0x02, 0x01, 0x1C]),
-        "enter" => Ok([0x80, 0x02, 0x00, 0x28]),
-        "escape" | "esc" => Ok([0x80, 0x02, 0x00, 0x29]),
-        "space" => Ok([0x80, 0x02, 0x00, 0x2C]),
-        "tab" => Ok([0x80, 0x02, 0x00, 0x2B]),
-        "backspace" => Ok([0x80, 0x02, 0x00, 0x2A]),
-        "mute" => Ok([0x80, 0x03, 0x00, 0xE2]),
-        "vol-up" | "volume-up" => Ok([0x80, 0x03, 0x00, 0xE9]),
-        "vol-down" | "volume-down" => Ok([0x80, 0x03, 0x00, 0xEA]),
-        "play-pause" => Ok([0x80, 0x03, 0x00, 0xCD]),
-        "next-track" => Ok([0x80, 0x03, 0x00, 0xB5]),
-        "prev-track" => Ok([0x80, 0x03, 0x00, 0xB6]),
-        "disabled" | "none" => Ok([0xFF, 0x00, 0x00, 0x00]),
-        other => bail!("Unknown mouse action '{other}'. Supported: left, right, middle, back, forward, dpi-cycle, dpi-up, dpi-down, dpi-shift, copy, paste, undo, cut, redo, enter, escape, space, tab, backspace, mute, vol-up, vol-down, play-pause, next-track, prev-track, disabled"),
+fn parse_single_hid_key(token: &str) -> Option<u8> {
+    if token.len() == 1 {
+        let b = token.as_bytes()[0];
+        if b.is_ascii_lowercase() {
+            return Some(0x04 + (b - b'a'));
+        }
+        if (b'1'..=b'9').contains(&b) {
+            return Some(0x1E + (b - b'1'));
+        }
+        if b == b'0' {
+            return Some(0x27);
+        }
     }
+    if let Some(num_str) = token.strip_prefix('f') {
+        if let Ok(n) = num_str.parse::<u8>() {
+            if (1..=12).contains(&n) {
+                return Some(0x3A + (n - 1));
+            }
+        }
+    }
+    match token {
+        "enter" | "return" => Some(0x28),
+        "escape" | "esc" => Some(0x29),
+        "backspace" | "bksp" => Some(0x2A),
+        "tab" => Some(0x2B),
+        "space" => Some(0x2C),
+        "minus" | "-" => Some(0x2D),
+        "equals" | "=" => Some(0x2E),
+        "capslock" | "caps" => Some(0x39),
+        "insert" | "ins" => Some(0x49),
+        "home" => Some(0x4A),
+        "pageup" | "pgup" => Some(0x4B),
+        "delete" | "del" => Some(0x4C),
+        "end" => Some(0x4D),
+        "pagedown" | "pgdn" => Some(0x4E),
+        "right-arrow" | "arrow-right" | "rightkey" => Some(0x4F),
+        "left-arrow" | "arrow-left" | "leftkey" => Some(0x50),
+        "down-arrow" | "arrow-down" | "down" => Some(0x51),
+        "up-arrow" | "arrow-up" | "up" => Some(0x52),
+        _ => None,
+    }
+}
+
+fn parse_mouse_action_preset(s: &str) -> Result<[u8; 4]> {
+    let lower = s.trim().to_lowercase().replace('_', "-").replace(' ', "-");
+    match lower.as_str() {
+        "left" | "left-click" => return Ok([0x80, 0x01, 0x00, 0x01]),
+        "right" | "right-click" => return Ok([0x80, 0x01, 0x00, 0x02]),
+        "middle" | "middle-click" | "wheel" => return Ok([0x80, 0x01, 0x00, 0x04]),
+        "back" | "side-1" => return Ok([0x80, 0x01, 0x00, 0x08]),
+        "forward" | "side-2" => return Ok([0x80, 0x01, 0x00, 0x10]),
+        "dpi-cycle" | "dpi" => return Ok([0x90, 0x05, 0x00, 0x00]),
+        "dpi-up" => return Ok([0x90, 0x03, 0x00, 0x00]),
+        "dpi-down" => return Ok([0x90, 0x04, 0x00, 0x00]),
+        "dpi-default" => return Ok([0x90, 0x06, 0x00, 0x00]),
+        "dpi-shift" | "sniper" => return Ok([0x90, 0x07, 0x00, 0x00]),
+        "copy" | "ctrl-c" => return Ok([0x80, 0x02, 0x01, 0x06]),
+        "paste" | "ctrl-v" => return Ok([0x80, 0x02, 0x01, 0x19]),
+        "cut" | "ctrl-x" => return Ok([0x80, 0x02, 0x01, 0x1B]),
+        "undo" | "ctrl-z" => return Ok([0x80, 0x02, 0x01, 0x1D]),
+        "redo" | "ctrl-y" => return Ok([0x80, 0x02, 0x01, 0x1C]),
+        "mute" => return Ok([0x80, 0x03, 0x00, 0xE2]),
+        "vol-up" | "volume-up" => return Ok([0x80, 0x03, 0x00, 0xE9]),
+        "vol-down" | "volume-down" => return Ok([0x80, 0x03, 0x00, 0xEA]),
+        "play-pause" => return Ok([0x80, 0x03, 0x00, 0xCD]),
+        "next-track" => return Ok([0x80, 0x03, 0x00, 0xB5]),
+        "prev-track" => return Ok([0x80, 0x03, 0x00, 0xB6]),
+        "disabled" | "none" => return Ok([0xFF, 0x00, 0x00, 0x00]),
+        _ => {}
+    }
+
+    // Support direct single keys (e.g. "c", "v", "f5", "space") or modifier combos (e.g. "ctrl+shift+c", "alt-f4")
+    let normalized = lower.replace('+', "-");
+    let parts: Vec<&str> = normalized.split('-').filter(|p| !p.is_empty()).collect();
+    if !parts.is_empty() {
+        let mut mods = 0u8;
+        let mut key_code = None;
+        let mut valid = true;
+        for (i, &part) in parts.iter().enumerate() {
+            if i + 1 < parts.len() {
+                match part {
+                    "ctrl" | "control" => mods |= 0x01,
+                    "shift" => mods |= 0x02,
+                    "alt" => mods |= 0x04,
+                    "win" | "meta" | "super" => mods |= 0x08,
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+            } else {
+                key_code = parse_single_hid_key(part);
+            }
+        }
+        if valid {
+            if let Some(code) = key_code {
+                return Ok([0x80, 0x02, mods, code]);
+            }
+        }
+    }
+
+    if let Some(code) = parse_single_hid_key(&lower) {
+        return Ok([0x80, 0x02, 0x00, code]);
+    }
+
+    bail!("Unknown mouse action '{s}'. Supported: any key (a-z, 0-9, f1-f12), combos (ctrl+c, shift+v, alt+f4), left, right, middle, back, forward, dpi-cycle, dpi-up, dpi-down, dpi-shift, copy, paste, undo, cut, redo, enter, escape, space, tab, backspace, mute, vol-up, vol-down, play-pause, next-track, prev-track, disabled")
 }
 
 fn print_snapshot(snapshot: &device::Snapshot) {
