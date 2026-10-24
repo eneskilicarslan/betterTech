@@ -1,0 +1,26 @@
+[package]
+name = "bettertech"
+version = "0.2.0"
+edition = "2024"
+description = "Fast-paced, lightweight, modern Logitech hardware controller in Rust (G HUB & Logi Options+ replacement)"
+license = "MIT"
+readme = "README.md"
+keywords = ["logitech", "hidpp", "g-hub", "options-plus", "gui"]
+categories = ["command-line-utilities", "gui", "hardware-support"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+hidapi = "2.6.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tray-icon = { version = "0.26.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
