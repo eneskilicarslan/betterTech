@@ -43,6 +43,7 @@ pub fn run(api: HidApi, devices: Vec<DeviceDescriptor>, start_minimized: bool) -
         "betterTech",
         options,
         Box::new(move |cc| {
+            configure_fonts(&cc.egui_ctx);
             configure_visuals(&cc.egui_ctx);
             let tray = match build_tray() {
                 Ok(tray) => Some(tray),
@@ -55,6 +56,36 @@ pub fn run(api: HidApi, devices: Vec<DeviceDescriptor>, start_minimized: bool) -
         }),
     )
     .map_err(|error| anyhow!("running the GUI: {error}"))
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    #[cfg(windows)]
+    {
+        if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
+            fonts.font_data.insert(
+                "segoeui".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "segoeui".to_owned());
+        }
+        if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
+            fonts.font_data.insert(
+                "seguisym".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("seguisym".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 fn configure_visuals(ctx: &egui::Context) {
@@ -188,7 +219,6 @@ struct BacklightEffectPreset {
     id: u8,
     name: &'static str,
     desc: &'static str,
-    icon: &'static str,
 }
 
 const BACKLIGHT_EFFECTS: [BacklightEffectPreset; 6] = [
@@ -196,37 +226,31 @@ const BACKLIGHT_EFFECTS: [BacklightEffectPreset; 6] = [
         id: 0,
         name: "Static",
         desc: "The keyboard lights up continuously.",
-        icon: "💡",
     },
     BacklightEffectPreset {
         id: 1,
         name: "Contrast",
         desc: "Modifier keys are lit up more brightly than other keys.",
-        icon: "🌗",
     },
     BacklightEffectPreset {
         id: 2,
         name: "Breathing",
         desc: "The lighting fades in and out slowly.",
-        icon: "💨",
     },
     BacklightEffectPreset {
         id: 3,
         name: "Waves",
         desc: "The keyboard lights up in an undulating wave pattern from left to right.",
-        icon: "🌊",
     },
     BacklightEffectPreset {
         id: 4,
         name: "Reaction",
         desc: "Each key you press lights up, lighting up your typing.",
-        icon: "⚡",
     },
     BacklightEffectPreset {
         id: 5,
         name: "Random",
         desc: "Keys light up randomly, creating an intriguing pattern.",
-        icon: "✨",
     },
 ];
 
@@ -890,7 +914,6 @@ fn render_tab_pill(
     ui: &mut egui::Ui,
     current_tab: &mut DeviceTab,
     tab: DeviceTab,
-    icon: &str,
     label: &str,
 ) {
     let is_active = *current_tab == tab;
@@ -907,13 +930,10 @@ fn render_tab_pill(
     let frame = egui::Frame::new()
         .fill(bg)
         .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(10, 6));
+        .inner_margin(egui::Margin::symmetric(14, 7));
 
     let resp = frame.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(icon).size(13.0));
-            ui.label(egui::RichText::new(label).color(text_color).strong().size(12.0));
-        });
+        ui.label(egui::RichText::new(label).color(text_color).strong().size(12.5));
     }).response;
 
     if resp.interact(egui::Sense::click()).clicked() {
@@ -1001,7 +1021,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("⚡ betterTech")
+                        egui::RichText::new("betterTech")
                             .color(egui::Color32::WHITE)
                             .size(16.0)
                             .strong(),
@@ -1053,17 +1073,17 @@ impl eframe::App for App {
                         });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.tray.is_some() && ui.button(egui::RichText::new("🗕 Hide to Tray").size(12.0)).clicked() {
+                        if self.tray.is_some() && ui.button(egui::RichText::new("Hide to Tray").size(12.0)).clicked() {
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
                             trim_working_set();
                         }
-                        if ui.button(egui::RichText::new("⚙ Preferences").size(12.0)).clicked() {
+                        if ui.button(egui::RichText::new("Preferences").size(12.0)).clicked() {
                             self.show_settings_modal = !self.show_settings_modal;
                         }
-                        if ui.button(egui::RichText::new("⚡ Apply All").size(12.0).strong().color(egui::Color32::from_rgb(14, 165, 233))).clicked() {
+                        if ui.button(egui::RichText::new("Apply All").size(12.0).strong().color(egui::Color32::from_rgb(14, 165, 233))).clicked() {
                             self.apply_saved();
                         }
-                        if ui.button(egui::RichText::new("🔄 Rescan").size(12.0)).clicked() {
+                        if ui.button(egui::RichText::new("Rescan").size(12.0)).clicked() {
                             self.reload_devices();
                         }
                     });
@@ -1112,7 +1132,7 @@ impl eframe::App for App {
                         || descriptor.name.to_lowercase().contains("mechanical")
                         || descriptor.name.to_lowercase().contains("craft")
                         || descriptor.name.to_lowercase().contains("keys");
-                    let icon = if is_keyboard { "⌨" } else { "🖱" };
+                    let type_badge = if is_keyboard { "KB" } else { "MS" };
 
                     let card_bg = if is_selected {
                         egui::Color32::from_rgb(20, 32, 48)
@@ -1140,15 +1160,16 @@ impl eframe::App for App {
                                 ui.add_space(3.0);
                             }
 
-                            // Circular icon badge
+                            // Type indicator badge
                             egui::Frame::new()
                                 .fill(if is_selected { egui::Color32::from_rgb(14, 165, 233) } else { egui::Color32::from_rgb(26, 36, 52) })
-                                .corner_radius(16.0)
-                                .inner_margin(egui::Margin::same(6))
+                                .corner_radius(4.0)
+                                .inner_margin(egui::Margin::symmetric(6, 4))
                                 .show(ui, |ui| {
                                     ui.label(
-                                        egui::RichText::new(icon)
-                                            .size(16.0)
+                                        egui::RichText::new(type_badge)
+                                            .size(10.5)
+                                            .strong()
                                             .color(if is_selected { egui::Color32::BLACK } else { egui::Color32::from_rgb(148, 163, 184) }),
                                     );
                                 });
@@ -1234,7 +1255,7 @@ impl eframe::App for App {
                 // Device Hero Banner Card
                 let is_kb = snapshot.device.name.to_lowercase().contains("keyboard")
                     || snapshot.device.name.to_lowercase().contains("mechanical");
-                let hero_icon = if is_kb { "⌨" } else { "🖱" };
+                let hero_badge = if is_kb { "KB" } else { "MS" };
                 let hero_category = if is_kb { "WIRELESS MECHANICAL KEYBOARD" } else { "LIGHTSPEED WIRELESS GAMING MOUSE" };
 
                 egui::Frame::new()
@@ -1244,14 +1265,14 @@ impl eframe::App for App {
                     .inner_margin(16.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            // Large icon badge
+                            // Large type badge
                             egui::Frame::new()
                                 .fill(egui::Color32::from_rgb(11, 16, 26))
                                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 42, 64)))
                                 .corner_radius(10.0)
-                                .inner_margin(egui::Margin::same(10))
+                                .inner_margin(egui::Margin::symmetric(14, 10))
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new(hero_icon).size(26.0).color(egui::Color32::from_rgb(14, 165, 233)));
+                                    ui.label(egui::RichText::new(hero_badge).size(20.0).strong().color(egui::Color32::from_rgb(14, 165, 233)));
                                 });
 
                             ui.add_space(10.0);
@@ -1283,14 +1304,14 @@ impl eframe::App for App {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // Live Battery Pill
                                 if let Some(battery) = &snapshot.battery {
-                                    let (bat_color, bat_bg, bat_icon) = if battery.status.contains("recharg") {
-                                        (egui::Color32::from_rgb(56, 189, 248), egui::Color32::from_rgb(12, 34, 52), "⚡")
+                                    let (bat_color, bat_bg) = if battery.status.contains("recharg") {
+                                        (egui::Color32::from_rgb(56, 189, 248), egui::Color32::from_rgb(12, 34, 52))
                                     } else if battery.level.unwrap_or(0) > 40 {
-                                        (egui::Color32::from_rgb(16, 185, 129), egui::Color32::from_rgb(12, 34, 26), "🔋")
+                                        (egui::Color32::from_rgb(16, 185, 129), egui::Color32::from_rgb(12, 34, 26))
                                     } else if battery.level.unwrap_or(0) > 20 {
-                                        (egui::Color32::from_rgb(245, 158, 11), egui::Color32::from_rgb(42, 28, 12), "🪫")
+                                        (egui::Color32::from_rgb(245, 158, 11), egui::Color32::from_rgb(42, 28, 12))
                                     } else {
-                                        (egui::Color32::from_rgb(239, 68, 68), egui::Color32::from_rgb(45, 18, 18), "🪫")
+                                        (egui::Color32::from_rgb(239, 68, 68), egui::Color32::from_rgb(45, 18, 18))
                                     };
 
                                     egui::Frame::new()
@@ -1300,8 +1321,8 @@ impl eframe::App for App {
                                         .inner_margin(egui::Margin::symmetric(10, 6))
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new(bat_icon).size(15.0));
-                                                ui.label(egui::RichText::new(&battery.text).strong().color(bat_color).size(14.0));
+                                                ui.label(egui::RichText::new("●").size(8.0).color(bat_color));
+                                                ui.label(egui::RichText::new(&battery.text).strong().color(bat_color).size(13.0));
                                                 if let Some(mv) = battery.voltage_mv {
                                                     ui.colored_label(egui::Color32::from_rgb(148, 163, 184), format!("{mv}mV"));
                                                 }
@@ -1319,7 +1340,7 @@ impl eframe::App for App {
                                         .show(ui, |ui| {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(14, 165, 233),
-                                                format!("⚡ {hz} Hz"),
+                                                format!("{hz} Hz"),
                                             );
                                         });
                                 }
@@ -1346,28 +1367,28 @@ impl eframe::App for App {
                             let has_hosts = snapshot.hosts.is_some();
 
                             if has_mouse_buttons {
-                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::MouseButtons, "🖱", "Button Remap");
+                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::MouseButtons, "Button Remap");
                             }
                             if has_controls {
-                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::ControlsRemap, "⌨", "Keys Remap");
+                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::ControlsRemap, "Keys Remap");
                             }
                             if has_backlight {
-                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::Backlight, "💡", "Backlight");
+                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::Backlight, "Backlight");
                             }
                             if has_keyboard_settings {
-                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::KeyboardSettings, "⚙", "Key Settings");
+                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::KeyboardSettings, "Key Settings");
                             }
                             if has_hosts {
-                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::EasySwitch, "🔀", "Easy-Switch");
+                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::EasySwitch, "Easy-Switch");
                             }
                             if has_power {
-                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::PerformancePower, "⚡", "Polling & Power");
+                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::PerformancePower, "Polling & Power");
                             }
                             if has_dpi {
-                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::SensorDpi, "🎯", "Sensor & DPI");
+                                render_tab_pill(ui, &mut self.current_tab, DeviceTab::SensorDpi, "Sensor & DPI");
                             }
-                            render_tab_pill(ui, &mut self.current_tab, DeviceTab::HardwareDiagnostics, "🔋", "Diagnostics");
-                            render_tab_pill(ui, &mut self.current_tab, DeviceTab::FeatureList, "📋", &format!("Features ({})", snapshot.device.features.len()));
+                            render_tab_pill(ui, &mut self.current_tab, DeviceTab::HardwareDiagnostics, "Diagnostics");
+                            render_tab_pill(ui, &mut self.current_tab, DeviceTab::FeatureList, &format!("Features ({})", snapshot.device.features.len()));
                         });
                     });
 
@@ -1808,7 +1829,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.heading(
-                            egui::RichText::new("🖱 Hardware Button Remapping")
+                            egui::RichText::new("Hardware Button Remapping")
                                 .color(egui::Color32::WHITE)
                                 .size(18.0),
                         );
@@ -1818,7 +1839,7 @@ impl App {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("🔄 Reset All Defaults").strong()).clicked() {
+                        if ui.button(egui::RichText::new("Reset All Defaults").strong()).clicked() {
                             self.reset_all_mouse_buttons();
                         }
                     });
@@ -2005,7 +2026,7 @@ impl App {
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             // Reset to default button if customized
                                             if is_custom {
-                                                if ui.button("↺ Reset").clicked() {
+                                                if ui.button("Reset").clicked() {
                                                     let def_name = default_names.get(idx).unwrap_or(&"Default");
                                                     self.set_mouse_button(btn.index, default_raw, def_name);
                                                 }
@@ -2078,7 +2099,7 @@ impl App {
                             }
                         });
 
-                    ui.label(egui::RichText::new("➔").color(egui::Color32::from_rgb(14, 165, 233)).size(16.0));
+                    ui.label(egui::RichText::new("->").color(egui::Color32::from_rgb(14, 165, 233)).strong().size(14.0));
 
                     let default_target = snapshot.controls[0].cid;
                     let current_to = self.to_cid.unwrap_or(default_target);
@@ -2099,10 +2120,10 @@ impl App {
                     let from = self.from_cid.unwrap_or(current_from);
                     let to = self.to_cid.unwrap_or(current_to);
 
-                    if ui.button(egui::RichText::new("⚡ Apply Remap").strong().color(egui::Color32::from_rgb(14, 165, 233))).clicked() {
+                    if ui.button(egui::RichText::new("Apply Remap").strong().color(egui::Color32::from_rgb(14, 165, 233))).clicked() {
                         self.apply_mapping(from, to);
                     }
-                    if ui.button("↺ Reset to Native").clicked() {
+                    if ui.button("Reset to Native").clicked() {
                         self.apply_mapping(from, from);
                     }
                 });
@@ -2112,7 +2133,7 @@ impl App {
 
         // Search & Filter row
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("🔍 Search controls by name or hex...").desired_width(280.0));
+            ui.add(egui::TextEdit::singleline(&mut self.search_query).hint_text("Search controls by name or hex...").desired_width(280.0));
             ui.checkbox(&mut self.filter_remapped_only, "Show remapped only");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.colored_label(egui::Color32::from_rgb(148, 163, 184), format!("{} controls total", snapshot.controls.len()));
@@ -2157,9 +2178,9 @@ impl App {
                             if is_remapped {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(16, 185, 129),
-                                    format!("➔ {} (0x{:04X})", control.mapped_to_name, control.mapped_to),
+                                    format!("-> {} (0x{:04X})", control.mapped_to_name, control.mapped_to),
                                 );
-                                if ui.small_button("↺ Native").clicked() {
+                                if ui.small_button("Native").clicked() {
                                     self.apply_mapping(control.cid, control.cid);
                                 }
                             } else {
@@ -2354,7 +2375,7 @@ impl App {
         // Callout target 1: FN Key
         draw_keycap_accent(&painter, fn_key, "Fn", egui::Color32::from_rgb(14, 165, 233));
         // Callout target 2: Lightbulb Key
-        draw_keycap_accent(&painter, lightbulb_key, "💡", egui::Color32::from_rgb(250, 204, 21));
+        draw_keycap_accent(&painter, lightbulb_key, "FX", egui::Color32::from_rgb(250, 204, 21));
         draw_keycap(&painter, rarrow1, true, rarrow1_glow);
         draw_keycap(&painter, rarrow2, true, rarrow2_glow);
         draw_keycap(&painter, rarrow3, true, rarrow3_glow);
@@ -2413,19 +2434,19 @@ impl App {
             egui::Color32::from_rgb(250, 204, 21),
         );
         let active_effect = BACKLIGHT_EFFECTS.get(backlight.current_effect as usize)
-            .map(|e| (e.name, e.icon))
-            .unwrap_or(("Static", "💡"));
+            .map(|e| e.name)
+            .unwrap_or("Static");
         painter.text(
             egui::pos2(callout2_rect.min.x + 10.0, callout2_rect.min.y + 27.0),
             egui::Align2::LEFT_CENTER,
-            format!("{} {}", active_effect.1, active_effect.0),
+            format!("FX: {active_effect}"),
             egui::FontId::proportional(11.5),
             egui::Color32::WHITE,
         );
         painter.text(
             egui::pos2(callout2_rect.min.x + 10.0, callout2_rect.min.y + 40.0),
             egui::Align2::LEFT_CENTER,
-            "Shortcut: Fn + 💡 key",
+            "Shortcut: Fn + Backlight key",
             egui::FontId::proportional(9.5),
             egui::Color32::from_rgb(148, 163, 184),
         );
@@ -2452,7 +2473,7 @@ impl App {
         painter.text(
             egui::pos2(batt_rect.min.x + 10.0, batt_rect.center().y),
             egui::Align2::LEFT_CENTER,
-            format!("{batt_level}% ⚡ ({batt_status})"),
+            format!("{batt_level}% ({batt_status})"),
             egui::FontId::proportional(11.0),
             batt_color,
         );
@@ -2480,7 +2501,7 @@ impl App {
                     } else {
                         (egui::Color32::TRANSPARENT, egui::Color32::from_rgb(148, 163, 184))
                     };
-                    if ui.add(egui::Button::new(egui::RichText::new("🎨 Backlight Effects").color(eff_txt).strong()).fill(eff_bg).corner_radius(6.0)).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("Backlight Effects").color(eff_txt).strong()).fill(eff_bg).corner_radius(6.0)).clicked() {
                         self.backlight_subview = BacklightSubview::Effects;
                     }
 
@@ -2489,7 +2510,7 @@ impl App {
                     } else {
                         (egui::Color32::TRANSPARENT, egui::Color32::from_rgb(148, 163, 184))
                     };
-                    if ui.add(egui::Button::new(egui::RichText::new("⚙ Illumination Settings").color(set_txt).strong()).fill(set_bg).corner_radius(6.0)).clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("Illumination Settings").color(set_txt).strong()).fill(set_bg).corner_radius(6.0)).clicked() {
                         self.backlight_subview = BacklightSubview::Settings;
                     }
                 });
@@ -2515,7 +2536,7 @@ impl App {
                                 .inner_margin(egui::Margin::symmetric(8, 3))
                                 .show(ui, |ui| {
                                     ui.label(
-                                        egui::RichText::new("⚡ REAL-TIME LIGHTING SIMULATOR")
+                                        egui::RichText::new("REAL-TIME LIGHTING SIMULATOR")
                                             .size(9.5)
                                             .strong()
                                             .color(egui::Color32::from_rgb(56, 189, 248)),
@@ -2586,13 +2607,18 @@ impl App {
 
                                 let resp = card_frame.show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        // Icon container
+                                        // Number badge container
                                         let icon_box = egui::Frame::new()
                                             .fill(if is_active { egui::Color32::from_rgb(14, 52, 80) } else { egui::Color32::from_rgb(22, 30, 44) })
-                                            .corner_radius(8.0)
-                                            .inner_margin(egui::Margin::symmetric(10, 8));
+                                            .corner_radius(6.0)
+                                            .inner_margin(egui::Margin::symmetric(9, 6));
                                         icon_box.show(ui, |ui| {
-                                            ui.label(egui::RichText::new(effect.icon).size(18.0));
+                                            ui.label(
+                                                egui::RichText::new(format!("{:02}", effect.id + 1))
+                                                    .size(13.0)
+                                                    .strong()
+                                                    .color(if is_active { egui::Color32::from_rgb(56, 189, 248) } else { egui::Color32::from_rgb(148, 163, 184) }),
+                                            );
                                         });
 
                                         ui.add_space(10.0);
@@ -2640,10 +2666,10 @@ impl App {
                                 .inner_margin(12.0)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.colored_label(egui::Color32::from_rgb(250, 204, 21), "💡");
+                                        ui.colored_label(egui::Color32::from_rgb(250, 204, 21), "Tip:");
                                         ui.colored_label(
                                             egui::Color32::from_rgb(148, 163, 184),
-                                            "Pro Tip: You can also cycle through backlight effects on the keyboard hardware by pressing Fn + 💡 key.",
+                                            "You can also cycle through backlight effects on the keyboard hardware by pressing Fn + Backlight key.",
                                         );
                                     });
                                 });
@@ -2780,7 +2806,7 @@ impl App {
                                     });
                                     ui.add_space(6.0);
                                     ui.horizontal(|ui| {
-                                        ui.colored_label(egui::Color32::from_rgb(250, 204, 21), "⚡ Lower brightness extends battery life.");
+                                        ui.colored_label(egui::Color32::from_rgb(250, 204, 21), "Note: Lower brightness extends battery life.");
                                     });
                                 });
 
@@ -2814,7 +2840,7 @@ impl App {
 
                             // 6. Reset Backlighting Button
                             ui.horizontal(|ui| {
-                                if ui.button(egui::RichText::new("🔄 RESET BACKLIGHTING").strong()).clicked() {
+                                if ui.button(egui::RichText::new("RESET BACKLIGHTING").strong()).clicked() {
                                     self.reset_backlighting();
                                 }
                             });
@@ -2834,7 +2860,7 @@ impl App {
             .inner_margin(16.0)
             .show(ui, |ui| {
                 ui.heading(
-                    egui::RichText::new("⚙ Keyboard Behavior & Hotkeys")
+                    egui::RichText::new("Keyboard Behavior & Hotkeys")
                         .color(egui::Color32::WHITE)
                         .size(18.0),
                 );
@@ -2878,7 +2904,9 @@ impl App {
                             ui.set_width(260.0);
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("⌨").size(18.0));
+                                    egui::Frame::new().fill(egui::Color32::from_rgb(24, 36, 52)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                                        ui.label(egui::RichText::new("F1-F12").strong().size(11.0).color(egui::Color32::from_rgb(56, 189, 248)));
+                                    });
                                     ui.label(egui::RichText::new("Standard F1 - F12").strong().size(14.0).color(egui::Color32::WHITE));
                                     if is_std {
                                         ui.colored_label(egui::Color32::from_rgb(14, 165, 233), "• ACTIVE");
@@ -2903,7 +2931,9 @@ impl App {
                             ui.set_width(260.0);
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("🎵").size(18.0));
+                                    egui::Frame::new().fill(egui::Color32::from_rgb(24, 36, 52)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                                        ui.label(egui::RichText::new("MEDIA").strong().size(11.0).color(egui::Color32::from_rgb(56, 189, 248)));
+                                    });
                                     ui.label(egui::RichText::new("Media / Action Keys").strong().size(14.0).color(egui::Color32::WHITE));
                                     if is_media {
                                         ui.colored_label(egui::Color32::from_rgb(14, 165, 233), "• ACTIVE");
@@ -2949,7 +2979,7 @@ impl App {
 
                     ui.horizontal(|ui| {
                         let lock_keys = [
-                            (3, "Windows Key", disabled.win_key, "⊞ Win"),
+                            (3, "Windows Key", disabled.win_key, "Win"),
                             (0, "Caps Lock", disabled.caps_lock, "Caps Lock"),
                             (1, "Scroll Lock", disabled.scroll_lock, "Scroll Lock"),
                             (2, "Num Lock", disabled.num_lock, "Num Lock"),
@@ -3000,7 +3030,7 @@ impl App {
             .inner_margin(16.0)
             .show(ui, |ui| {
                 ui.heading(
-                    egui::RichText::new("🔀 Easy-Switch Multi-Host Channels")
+                    egui::RichText::new("Easy-Switch Multi-Host Channels")
                         .color(egui::Color32::WHITE)
                         .size(18.0),
                 );
@@ -3023,9 +3053,20 @@ impl App {
                             .show(ui, |ui| {
                                 ui.set_width(170.0);
                                 ui.vertical_centered(|ui| {
-                                    // Mini Desktop Monitor Icon
-                                    ui.label(egui::RichText::new("🖥").size(28.0).color(if slot.paired { egui::Color32::from_rgb(14, 165, 233) } else { egui::Color32::from_rgb(71, 85, 105) }));
-                                    ui.add_space(4.0);
+                                    // Host channel badge
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_rgb(22, 32, 48))
+                                        .corner_radius(6.0)
+                                        .inner_margin(egui::Margin::symmetric(12, 5))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("CH {}", slot.index))
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(if slot.paired { egui::Color32::from_rgb(14, 165, 233) } else { egui::Color32::from_rgb(71, 85, 105) }),
+                                            );
+                                        });
+                                    ui.add_space(6.0);
                                     ui.label(
                                         egui::RichText::new(format!("HOST {}", slot.index))
                                             .strong()
@@ -3036,7 +3077,7 @@ impl App {
 
                                     if slot.paired {
                                         egui::Frame::new().fill(egui::Color32::from_rgb(12, 34, 28)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
-                                            ui.label(egui::RichText::new("✓ PAIRED").size(9.5).color(egui::Color32::from_rgb(16, 185, 129)).strong());
+                                            ui.label(egui::RichText::new("PAIRED").size(9.5).color(egui::Color32::from_rgb(16, 185, 129)).strong());
                                         });
                                         ui.add_space(8.0);
                                         if ui.button(egui::RichText::new("Switch to Host").strong().size(12.0)).clicked() {
@@ -3063,7 +3104,7 @@ impl App {
             .inner_margin(16.0)
             .show(ui, |ui| {
                 ui.heading(
-                    egui::RichText::new("⚡ Polling Rate & Report Frequency")
+                    egui::RichText::new("Polling Rate & Report Frequency")
                         .color(egui::Color32::WHITE)
                         .size(18.0),
                 );
@@ -3074,10 +3115,10 @@ impl App {
                 ui.add_space(16.0);
 
                 let rate_options = [
-                    (1000, "1 ms Latency", "🏆 Esports Competitive", egui::Color32::from_rgb(14, 165, 233)),
-                    (500, "2 ms Latency", "🚀 High Performance", egui::Color32::from_rgb(56, 189, 248)),
-                    (250, "4 ms Latency", "⚖ Balanced Gaming", egui::Color32::from_rgb(148, 163, 184)),
-                    (125, "8 ms Latency", "🌿 Office Power Saver", egui::Color32::from_rgb(16, 185, 129)),
+                    (1000, "1 ms Latency", "Esports Competitive", egui::Color32::from_rgb(14, 165, 233)),
+                    (500, "2 ms Latency", "High Performance", egui::Color32::from_rgb(56, 189, 248)),
+                    (250, "4 ms Latency", "Balanced Gaming", egui::Color32::from_rgb(148, 163, 184)),
+                    (125, "8 ms Latency", "Office Power Saver", egui::Color32::from_rgb(16, 185, 129)),
                 ];
 
                 let current_hz = snapshot.polling_rate_hz.unwrap_or(1000);
@@ -3094,7 +3135,7 @@ impl App {
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new(format!("{rate} Hz")).strong().size(17.0).color(if is_active { egui::Color32::WHITE } else { egui::Color32::from_rgb(226, 232, 240) }));
                                     if is_active {
-                                        ui.colored_label(egui::Color32::from_rgb(14, 165, 233), "✓");
+                                        ui.colored_label(egui::Color32::from_rgb(14, 165, 233), "ACTIVE");
                                     }
                                 });
                                 ui.add_space(2.0);
@@ -3117,7 +3158,7 @@ impl App {
                     ui.add_space(14.0);
 
                     ui.heading(
-                        egui::RichText::new("🔋 Hardware Power Operating Mode")
+                        egui::RichText::new("Hardware Power Operating Mode")
                             .color(egui::Color32::WHITE)
                             .size(18.0),
                     );
@@ -3138,7 +3179,9 @@ impl App {
                             ui.set_width(320.0);
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("🚀").size(20.0));
+                                    egui::Frame::new().fill(egui::Color32::from_rgb(14, 44, 68)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                                        ui.label(egui::RichText::new("PERF").size(10.0).strong().color(egui::Color32::from_rgb(56, 189, 248)));
+                                    });
                                     ui.label(egui::RichText::new("Performance Mode").strong().size(15.0).color(egui::Color32::WHITE));
                                     if is_perf {
                                         egui::Frame::new().fill(egui::Color32::from_rgb(14, 44, 68)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
@@ -3165,7 +3208,9 @@ impl App {
                             ui.set_width(320.0);
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("🌿").size(20.0));
+                                    egui::Frame::new().fill(egui::Color32::from_rgb(16, 44, 30)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
+                                        ui.label(egui::RichText::new("ECO").size(10.0).strong().color(egui::Color32::from_rgb(110, 231, 183)));
+                                    });
                                     ui.label(egui::RichText::new("Endurance Mode").strong().size(15.0).color(egui::Color32::WHITE));
                                     if is_endurance {
                                         egui::Frame::new().fill(egui::Color32::from_rgb(16, 44, 30)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(6, 2)).show(ui, |ui| {
@@ -3198,7 +3243,7 @@ impl App {
             .inner_margin(16.0)
             .show(ui, |ui| {
                 ui.heading(
-                    egui::RichText::new("🎯 HERO Optical Sensor DPI Stages")
+                    egui::RichText::new("HERO Optical Sensor DPI Stages")
                         .color(egui::Color32::WHITE)
                         .size(18.0),
                 );
@@ -3256,7 +3301,7 @@ impl App {
                                             });
 
                                         if is_active {
-                                            ui.colored_label(egui::Color32::from_rgb(14, 165, 233), "✓");
+                                            ui.colored_label(egui::Color32::from_rgb(14, 165, 233), "ACTIVE");
                                         }
                                     });
 
@@ -3300,7 +3345,7 @@ impl App {
     fn render_settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings_modal;
         let mut close_modal = false;
-        egui::Window::new("⚙ betterTech Preferences")
+        egui::Window::new("betterTech Preferences")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -3351,7 +3396,7 @@ impl App {
                         ui.label(egui::RichText::new("System Tray & Background Mode").size(15.0).strong().color(egui::Color32::WHITE));
                         ui.add_space(4.0);
                         ui.colored_label(egui::Color32::from_rgb(148, 163, 184), "• Closing the window minimizes betterTech directly to your Windows notification area.");
-                        ui.colored_label(egui::Color32::from_rgb(148, 163, 184), "• Click the cyan lightning bolt ⚡ tray icon anytime to restore the dashboard instantly.");
+                        ui.colored_label(egui::Color32::from_rgb(148, 163, 184), "• Click the system tray icon anytime to restore the dashboard instantly.");
                     });
 
                 ui.add_space(10.0);
@@ -3367,13 +3412,13 @@ impl App {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             egui::Frame::new().fill(egui::Color32::from_rgb(12, 38, 28)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
-                                ui.label(egui::RichText::new("✓ ~12 MB RAM footprint").size(11.0).color(egui::Color32::from_rgb(16, 185, 129)).strong());
+                                ui.label(egui::RichText::new("~12 MB RAM footprint").size(11.0).color(egui::Color32::from_rgb(16, 185, 129)).strong());
                             });
                             egui::Frame::new().fill(egui::Color32::from_rgb(14, 44, 68)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
-                                ui.label(egui::RichText::new("✓ 0% Idle CPU").size(11.0).color(egui::Color32::from_rgb(56, 189, 248)).strong());
+                                ui.label(egui::RichText::new("0% Idle CPU").size(11.0).color(egui::Color32::from_rgb(56, 189, 248)).strong());
                             });
                             egui::Frame::new().fill(egui::Color32::from_rgb(34, 24, 52)).corner_radius(4.0).inner_margin(egui::Margin::symmetric(8, 3)).show(ui, |ui| {
-                                ui.label(egui::RichText::new("✓ 0 Telemetry Services").size(11.0).color(egui::Color32::from_rgb(192, 132, 252)).strong());
+                                ui.label(egui::RichText::new("0 Telemetry Services").size(11.0).color(egui::Color32::from_rgb(192, 132, 252)).strong());
                             });
                         });
                         ui.add_space(6.0);
@@ -3404,7 +3449,7 @@ impl App {
     }
 
     fn render_hardware_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        ui.heading(egui::RichText::new("🔋 Hardware & Power Diagnostics").color(egui::Color32::WHITE).size(18.0));
+        ui.heading(egui::RichText::new("Hardware & Power Diagnostics").color(egui::Color32::WHITE).size(18.0));
         ui.colored_label(egui::Color32::from_rgb(148, 163, 184), "Live telemetry directly read from hardware microcontrollers.");
         ui.add_space(14.0);
 
@@ -3512,7 +3557,7 @@ impl App {
     }
 
     fn render_features_tab(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        ui.heading(egui::RichText::new("⚡ HID++ 2.0 Feature Catalog").color(egui::Color32::WHITE).size(18.0));
+        ui.heading(egui::RichText::new("HID++ 2.0 Feature Catalog").color(egui::Color32::WHITE).size(18.0));
         ui.colored_label(
             egui::Color32::from_rgb(148, 163, 184),
             format!("{} hardware features discovered on device firmware.", snapshot.device.features.len()),
