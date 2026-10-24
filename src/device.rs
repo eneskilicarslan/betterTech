@@ -142,7 +142,7 @@ fn scan_path(path: &str) -> Vec<DeviceDescriptor> {
 
 fn probe(transport: &Transport, index: u8) -> Result<Option<DeviceDescriptor>> {
     if transport
-        .get_feature_with_timeout(0x0003, Duration::from_millis(700))?
+        .get_feature_with_timeout(0x0003, Duration::from_millis(200))?
         .is_none()
     {
         return Ok(None);
@@ -153,7 +153,7 @@ fn probe(transport: &Transport, index: u8) -> Result<Option<DeviceDescriptor>> {
     let info = transport.device_info()?;
     let mut features = transport.feature_set()?;
     if features.is_empty() {
-        sleep(Duration::from_millis(60));
+        sleep(Duration::from_millis(30));
         features = transport.feature_set()?;
     }
     Ok(Some(DeviceDescriptor {
@@ -195,22 +195,49 @@ pub fn read_battery(api: &HidApi, device: &DeviceDescriptor) -> Result<Option<Ba
 
 pub fn snapshot(api: &HidApi, device: &DeviceDescriptor) -> Result<Snapshot> {
     let transport = open(api, device)?;
-    let battery = transport.battery().ok().flatten().map(battery_view);
-    let firmware = transport
-        .firmware()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|firmware| !firmware.name.is_empty())
-        .map(firmware_view)
-        .collect();
-    let controls = transport
-        .controls()
-        .unwrap_or_default()
-        .into_iter()
-        .map(control_view)
-        .collect();
-    let report_rate_ms = transport.report_rate_ms().ok().flatten();
-    let supported_polling_rates = transport.supported_report_rates().unwrap_or_default();
+    let has = |id: u16| device.features.iter().any(|f| f.id == id);
+
+    let battery = if has(0x1000) || has(0x1004) {
+        transport.battery().ok().flatten().map(battery_view)
+    } else {
+        None
+    };
+
+    let firmware = if has(0x0003) {
+        transport
+            .firmware()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|firmware| !firmware.name.is_empty())
+            .map(firmware_view)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let controls = if has(0x1B04) {
+        transport
+            .controls()
+            .unwrap_or_default()
+            .into_iter()
+            .map(control_view)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let report_rate_ms = if has(0x8060) {
+        transport.report_rate_ms().ok().flatten()
+    } else {
+        None
+    };
+
+    let supported_polling_rates = if has(0x8060) {
+        transport.supported_report_rates().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let polling_rate_hz = report_rate_ms.map(|ms| match ms {
         1 => 1000,
         2 => 500,
@@ -218,9 +245,25 @@ pub fn snapshot(api: &HidApi, device: &DeviceDescriptor) -> Result<Snapshot> {
         8 => 125,
         other => 1000 / (other as u16).max(1),
     });
-    let mode_status = transport.mode_status().ok().flatten();
-    let dpi = transport.onboard_dpi().ok().flatten();
-    let mut backlight = transport.backlight().ok().flatten();
+
+    let mode_status = if has(0x8071) {
+        transport.mode_status().ok().flatten()
+    } else {
+        None
+    };
+
+    let dpi = if has(0x2201) || has(0x2110) || has(0x2111) {
+        transport.onboard_dpi().ok().flatten()
+    } else {
+        None
+    };
+
+    let mut backlight = if has(0x1982) {
+        transport.backlight().ok().flatten()
+    } else {
+        None
+    };
+
     if let Some(b) = &mut backlight {
         if let Ok(cfg) = crate::config::load() {
             if let Some(s) = cfg.device_settings.iter().find(|s| s.product_id == device.product_id && s.unit_id == device.unit_id) {
@@ -233,10 +276,30 @@ pub fn snapshot(api: &HidApi, device: &DeviceDescriptor) -> Result<Snapshot> {
             }
         }
     }
-    let fn_inverted = transport.fn_inversion().ok().flatten();
-    let hosts = transport.hosts().ok().flatten();
-    let disabled_keys = transport.disabled_keys().ok().flatten();
-    let mouse_buttons = transport.mouse_buttons().ok().flatten();
+
+    let fn_inverted = if has(0x40A3) {
+        transport.fn_inversion().ok().flatten()
+    } else {
+        None
+    };
+
+    let hosts = if has(0x1815) {
+        transport.hosts().ok().flatten()
+    } else {
+        None
+    };
+
+    let disabled_keys = if has(0x4521) {
+        transport.disabled_keys().ok().flatten()
+    } else {
+        None
+    };
+
+    let mouse_buttons = if has(0x8100) {
+        transport.mouse_buttons().ok().flatten()
+    } else {
+        None
+    };
 
     Ok(Snapshot {
         device: device.clone(),
