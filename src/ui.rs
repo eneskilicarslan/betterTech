@@ -34,6 +34,131 @@ pub fn trim_working_set() {
 #[cfg(not(windows))]
 pub fn trim_working_set() {}
 
+#[cfg(windows)]
+mod win32_window {
+    const GWL_STYLE: i32 = -16;
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_OVERLAPPEDWINDOW: isize = 0x00CF_0000;
+    const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+    const WS_EX_APPWINDOW: isize = 0x0004_0000;
+    const DWMWA_CLOAK: u32 = 13;
+    const SW_HIDE: i32 = 0;
+    const SW_SHOW: i32 = 5;
+    const SW_RESTORE: i32 = 9;
+
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+        fn EnumThreadWindows(
+            dw_thread_id: u32,
+            lpfn: unsafe extern "system" fn(isize, isize) -> i32,
+            l_param: isize,
+        ) -> i32;
+        fn GetWindowLongPtrW(h_wnd: isize, n_index: i32) -> isize;
+        fn SetWindowLongPtrW(h_wnd: isize, n_index: i32, dw_new_long: isize) -> isize;
+        fn ShowWindow(h_wnd: isize, n_cmd_show: i32) -> i32;
+        fn SetForegroundWindow(h_wnd: isize) -> i32;
+    }
+
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: isize,
+            dw_attribute: u32,
+            pv_attribute: *const core::ffi::c_void,
+            cb_attribute: u32,
+        ) -> i32;
+    }
+
+    unsafe extern "system" fn enum_thread_wnd_proc(hwnd: isize, lparam: isize) -> i32 {
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            if (style & WS_OVERLAPPEDWINDOW) != 0 {
+                let out = lparam as *mut isize;
+                *out = hwnd;
+                return 0;
+            }
+            1
+        }
+    }
+
+    pub fn find_main_hwnd() -> isize {
+        let mut hwnd: isize = 0;
+        unsafe {
+            let tid = GetCurrentThreadId();
+            EnumThreadWindows(tid, enum_thread_wnd_proc, (&raw mut hwnd) as isize);
+        }
+        hwnd
+    }
+
+    pub fn cloak_and_hide_from_taskbar(hwnd: isize) {
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            let cloaked: i32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAK,
+                (&raw const cloaked).cast(),
+                core::mem::size_of::<i32>() as u32,
+            );
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let new_ex_style = (ex_style | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex_style);
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+
+    pub fn uncloak_and_show_in_taskbar(hwnd: isize) {
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let new_ex_style = (ex_style & !WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex_style);
+            let cloaked: i32 = 0;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAK,
+                (&raw const cloaked).cast(),
+                core::mem::size_of::<i32>() as u32,
+            );
+        }
+    }
+
+    pub fn force_hide(hwnd: isize) {
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+
+    pub fn show_and_focus(hwnd: isize) {
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod win32_window {
+    pub fn find_main_hwnd() -> isize {
+        0
+    }
+    pub fn cloak_and_hide_from_taskbar(_hwnd: isize) {}
+    pub fn uncloak_and_show_in_taskbar(_hwnd: isize) {}
+    pub fn force_hide(_hwnd: isize) {}
+    pub fn show_and_focus(_hwnd: isize) {}
+}
+
 // ============================================================================
 // Modern Obsidian / Zinc Color Palette
 // ============================================================================
@@ -418,7 +543,8 @@ pub fn run(api: HidApi, devices: Vec<DeviceDescriptor>, start_minimized: bool) -
             .with_title("betterTech — Logitech Hardware Studio")
             .with_inner_size([1120.0, 740.0])
             .with_min_inner_size([880.0, 580.0])
-            .with_visible(!start_minimized),
+            .with_visible(!start_minimized)
+            .with_active(!start_minimized),
         ..Default::default()
     };
     eframe::run_native(
@@ -427,6 +553,7 @@ pub fn run(api: HidApi, devices: Vec<DeviceDescriptor>, start_minimized: bool) -
         Box::new(move |cc| {
             configure_fonts(&cc.egui_ctx);
             configure_visuals(&cc.egui_ctx);
+            let main_hwnd = win32_window::find_main_hwnd();
             let tray = match build_tray() {
                 Ok(tray) => Some(tray),
                 Err(error) => {
@@ -434,7 +561,21 @@ pub fn run(api: HidApi, devices: Vec<DeviceDescriptor>, start_minimized: bool) -
                     None
                 }
             };
-            Ok(Box::new(App::new(api, devices, tray, cc.egui_ctx.clone())))
+            let hide_in_tray = start_minimized && tray.is_some();
+            if hide_in_tray {
+                // eframe unconditionally calls `window.set_visible(true)` after rendering
+                // the first frame (`post_rendering`). Cloak the window and mark it as a
+                // toolwindow beforehand so neither the window nor a taskbar icon flashes.
+                win32_window::cloak_and_hide_from_taskbar(main_hwnd);
+            }
+            Ok(Box::new(App::new(
+                api,
+                devices,
+                tray,
+                cc.egui_ctx.clone(),
+                main_hwnd,
+                hide_in_tray,
+            )))
         }),
     )
     .map_err(|error| anyhow!("running the GUI: {error}"))
@@ -573,8 +714,20 @@ fn spawn_tray_waker(ctx: egui::Context, sender: Sender<TrayEvent>) {
         loop {
             let mut had_event = false;
             while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                had_event = true;
-                let _ = sender.send(TrayEvent::Icon(event));
+                if matches!(
+                    event,
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } | TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                ) {
+                    had_event = true;
+                    let _ = sender.send(TrayEvent::Icon(event));
+                }
             }
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 had_event = true;
@@ -586,11 +739,6 @@ fn spawn_tray_waker(ctx: egui::Context, sender: Sender<TrayEvent>) {
             std::thread::sleep(Duration::from_millis(120));
         }
     });
-}
-
-fn show_window(ctx: &egui::Context) {
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
 }
 
 // ============================================================================
@@ -810,6 +958,9 @@ struct App {
     show_settings_modal: bool,
     autostart_enabled: bool,
     is_quitting: bool,
+    main_hwnd: isize,
+    hide_on_startup_frames: u8,
+    window_cloaked: bool,
     startup_trims_remaining: u8,
     selected_mouse_button: u8,
     mouse_preset_filter: MousePresetFilter,
@@ -822,13 +973,15 @@ impl App {
         devices: Vec<DeviceDescriptor>,
         tray: Option<TrayParts>,
         ctx: egui::Context,
+        main_hwnd: isize,
+        start_minimized: bool,
     ) -> Self {
         let (sender, tray_events) = mpsc::channel();
         if tray.is_some() {
             spawn_tray_waker(ctx, sender);
         }
         let action_sender = spawn_hardware_worker();
-        Self {
+        let mut app = Self {
             api,
             devices,
             selected: 0,
@@ -847,11 +1000,36 @@ impl App {
             show_settings_modal: false,
             autostart_enabled: crate::autostart::is_enabled(),
             is_quitting: false,
+            main_hwnd,
+            hide_on_startup_frames: if start_minimized { 2 } else { 0 },
+            window_cloaked: start_minimized,
             startup_trims_remaining: 3,
             selected_mouse_button: 0,
             mouse_preset_filter: MousePresetFilter::Keys,
             recording_mouse_button: None,
+        };
+        if start_minimized {
+            app.apply_saved();
         }
+        app
+    }
+
+    fn show_from_tray(&mut self, ctx: &egui::Context) {
+        self.hide_on_startup_frames = 0;
+        if self.window_cloaked {
+            win32_window::uncloak_and_show_in_taskbar(self.main_hwnd);
+            self.window_cloaked = false;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        win32_window::show_and_focus(self.main_hwnd);
+    }
+
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        win32_window::force_hide(self.main_hwnd);
+        trim_working_set();
     }
 
     fn set_status(&mut self, msg: &str, is_error: bool) {
@@ -1484,11 +1662,19 @@ fn egui_key_to_hid(key: egui::Key) -> Option<u8> {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.hide_on_startup_frames > 0 {
+            if self.hide_on_startup_frames == 2 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            self.hide_on_startup_frames -= 1;
+            win32_window::force_hide(self.main_hwnd);
+            trim_working_set();
+        }
+
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.tray.is_some() && !self.is_quitting {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                trim_working_set();
+                self.hide_to_tray(ctx);
             }
         }
 
@@ -1539,14 +1725,14 @@ impl eframe::App for App {
                 | TrayEvent::Icon(TrayIconEvent::DoubleClick {
                     button: MouseButton::Left,
                     ..
-                }) => show_window(ctx),
+                }) => self.show_from_tray(ctx),
                 TrayEvent::Icon(_) => {}
                 TrayEvent::Menu(event) => {
                     let Some(tray) = &self.tray else {
                         continue;
                     };
                     if event.id == *tray.show_item.id() {
-                        show_window(ctx);
+                        self.show_from_tray(ctx);
                     } else if event.id == *tray.quit_item.id() {
                         self.is_quitting = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1612,7 +1798,12 @@ impl eframe::App for App {
                             .size(16.0)
                             .strong(),
                     );
-                    pill_badge(ui, "v0.3.0", Theme::TEXT_SECONDARY, Theme::BG_ELEVATED);
+                    pill_badge(
+                        ui,
+                        concat!("v", env!("CARGO_PKG_VERSION")),
+                        Theme::TEXT_SECONDARY,
+                        Theme::BG_ELEVATED,
+                    );
 
                     ui.add_space(12.0);
 
@@ -1638,8 +1829,8 @@ impl eframe::App for App {
                     // Right-aligned global actions
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.tray.is_some() && toolbar_button(ui, IconKind::Tray, "Minimize", false) {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                            trim_working_set();
+                            let ctx = ui.ctx().clone();
+                            self.hide_to_tray(&ctx);
                         }
                         if toolbar_button(ui, IconKind::Settings, "Preferences", false) {
                             self.show_settings_modal = !self.show_settings_modal;

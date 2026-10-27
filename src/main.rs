@@ -18,6 +18,10 @@ use hidapi::HidApi;
     about = "Lightweight Logitech HID++ control for MX Mechanical and G305"
 )]
 struct Cli {
+    /// Start minimized to system tray
+    #[arg(long, short)]
+    minimized: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -190,7 +194,10 @@ fn main() -> Result<()> {
     attach_parent_console();
 
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Command::Gui { minimized: false });
+    let top_minimized = cli.minimized;
+    let command = cli.command.unwrap_or(Command::Gui {
+        minimized: top_minimized,
+    });
     let api = HidApi::new().context("initializing hidapi")?;
     let devices = device::discover(&api)?;
 
@@ -695,7 +702,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Gui { minimized } => {
-            ui::run(api, devices, minimized)?;
+            ui::run(api, devices, minimized || top_minimized)?;
         }
     }
 
