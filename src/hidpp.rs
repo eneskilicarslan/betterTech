@@ -2,16 +2,31 @@ use anyhow::{Context, Result, bail};
 use hidapi::{HidApi, HidDevice};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const LOGITECH_VID: u16 = 0x046d;
 pub const HIDPP_USAGE_PAGE: u16 = 0xff00;
+pub const HIDPP_BLE_USAGE_PAGE: u16 = 0xff43;
 pub const HIDPP_LONG_USAGE: u16 = 0x0002;
+pub const HIDPP_BLE_LONG_USAGE: u16 = 0x0202;
 pub const HIDPP_SHORT_REPORT: u8 = 0x10;
 pub const HIDPP_LONG_REPORT: u8 = 0x11;
+const HIDPP10_ERROR: u8 = 0x8F;
+const HIDPP20_ERROR: u8 = 0xFF;
 const REQUEST_LEN: usize = 20;
 const READ_LEN: usize = 64;
+
+fn path_mutex(path: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map_mutex = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(path.to_ascii_lowercase())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Feature(u8);
@@ -26,11 +41,13 @@ pub struct Transport {
     device: HidDevice,
     device_index: u8,
     software_id: Cell<u8>,
+    path_lock: Arc<Mutex<()>>,
 }
 
 impl Transport {
     pub fn open(api: &HidApi, path: &str, device_index: u8) -> Result<Self> {
         let cpath = CString::new(path).context("HID device path contains a NUL byte")?;
+        let path_lock = path_mutex(path);
         let device = api
             .open_path(&cpath)
             .with_context(|| format!("opening HID device {path}"))?;
@@ -38,6 +55,7 @@ impl Transport {
             device,
             device_index,
             software_id: Cell::new(0x01),
+            path_lock,
         })
     }
 
@@ -686,17 +704,22 @@ impl Transport {
         if params.len() > REQUEST_LEN - 4 {
             bail!("HID++ request payload is too long");
         }
-        let software_id = self.next_software_id();
-        let mut request = vec![
-            HIDPP_LONG_REPORT,
-            self.device_index,
-            feature_index,
-            (function << 4) | software_id,
-        ];
-        request.extend_from_slice(params);
-        request.resize(REQUEST_LEN, 0);
+        let _guard = self
+            .path_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        for _ in 0..attempts {
+        for attempt in 0..attempts {
+            let software_id = self.next_software_id();
+            let mut request = vec![
+                HIDPP_LONG_REPORT,
+                self.device_index,
+                feature_index,
+                (function << 4) | software_id,
+            ];
+            request.extend_from_slice(params);
+            request.resize(REQUEST_LEN, 0);
+
             self.drain();
             let written = self
                 .device
@@ -705,8 +728,15 @@ impl Transport {
             if written == 0 {
                 continue;
             }
-            if let Some(reply) = self.read_reply(feature_index, function, software_id, timeout)? {
-                return Ok(Some(reply));
+            match self.read_reply(feature_index, function, software_id, timeout)? {
+                ReplyOutcome::Reply(reply) => return Ok(Some(reply)),
+                ReplyOutcome::PermanentError => return Ok(None),
+                ReplyOutcome::TransientError => {
+                    if attempt + 1 < attempts {
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                }
+                ReplyOutcome::Timeout => {}
             }
         }
         Ok(None)
@@ -725,13 +755,14 @@ impl Transport {
         function: u8,
         software_id: u8,
         timeout: Duration,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<ReplyOutcome> {
         let deadline = Instant::now() + timeout;
         let mut buffer = [0u8; READ_LEN];
+        let expected_func_sw = (function << 4) | software_id;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok(None);
+                return Ok(ReplyOutcome::Timeout);
             }
             let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
             let read = self
@@ -739,7 +770,7 @@ impl Transport {
                 .read_timeout(&mut buffer, millis)
                 .context("reading HID++ reply")?;
             if read == 0 {
-                return Ok(None);
+                return Ok(ReplyOutcome::Timeout);
             }
             if read < 4 {
                 continue;
@@ -747,20 +778,40 @@ impl Transport {
             if buffer[0] != HIDPP_LONG_REPORT && buffer[0] != HIDPP_SHORT_REPORT {
                 continue;
             }
-            if buffer[1] != self.device_index
-                || buffer[2] != feature_index
-                || buffer[3] != (function << 4) | software_id
-            {
+            if buffer[1] != self.device_index {
                 continue;
             }
-            return Ok(Some(buffer[4..read].to_vec()));
+            if (buffer[2] == HIDPP10_ERROR || buffer[2] == HIDPP20_ERROR)
+                && read >= 5
+                && buffer[3] == feature_index
+                && buffer[4] == expected_func_sw
+            {
+                let err_code = buffer.get(5).copied().unwrap_or(0);
+                // 0xFF is an explicit HID++ 2.0 feature error; 0x8F with 0x09 (Unknown Device)
+                // or 0x01 (Invalid SubID) means empty receiver slot or non-HID++ 2.0 target.
+                if buffer[2] == HIDPP20_ERROR || err_code == 0x09 || err_code == 0x01 {
+                    return Ok(ReplyOutcome::PermanentError);
+                }
+                return Ok(ReplyOutcome::TransientError);
+            }
+            if buffer[2] != feature_index || buffer[3] != expected_func_sw {
+                continue;
+            }
+            return Ok(ReplyOutcome::Reply(buffer[4..read].to_vec()));
         }
     }
 
     fn drain(&self) {
         let mut buffer = [0u8; READ_LEN];
-        while matches!(self.device.read_timeout(&mut buffer, 5), Ok(read) if read > 0) {}
+        while matches!(self.device.read_timeout(&mut buffer, 3), Ok(read) if read > 0) {}
     }
+}
+
+enum ReplyOutcome {
+    Reply(Vec<u8>),
+    PermanentError,
+    TransientError,
+    Timeout,
 }
 
 #[derive(Clone, Debug)]

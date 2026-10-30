@@ -79,12 +79,16 @@ pub struct ControlView {
 }
 
 pub fn discover(api: &HidApi) -> Result<Vec<DeviceDescriptor>> {
-    let mut paths: Vec<String> = api
+    let fresh_api = HidApi::new().ok();
+    let list_api = fresh_api.as_ref().unwrap_or(api);
+    let mut paths: Vec<String> = list_api
         .device_list()
         .filter(|info| {
             info.vendor_id() == hidpp::LOGITECH_VID
-                && info.usage_page() == hidpp::HIDPP_USAGE_PAGE
-                && info.usage() == hidpp::HIDPP_LONG_USAGE
+                && ((info.usage_page() == hidpp::HIDPP_USAGE_PAGE
+                    && info.usage() == hidpp::HIDPP_LONG_USAGE)
+                    || (info.usage_page() == hidpp::HIDPP_BLE_USAGE_PAGE
+                        && info.usage() == hidpp::HIDPP_BLE_LONG_USAGE))
         })
         .map(|info| info.path().to_string_lossy().into_owned())
         .collect();
@@ -137,20 +141,26 @@ fn scan_path(path: &str) -> Vec<DeviceDescriptor> {
 }
 
 fn probe(transport: &Transport, index: u8) -> Result<Option<DeviceDescriptor>> {
-    if transport
+    let has_dev_info = transport
         .get_feature_with_timeout(0x0003, Duration::from_millis(450))?
-        .is_none()
+        .is_some();
+    if !has_dev_info
+        && transport
+            .get_feature_with_timeout(0x0001, Duration::from_millis(300))?
+            .is_none()
     {
         return Ok(None);
     }
     let name = transport
-        .name()?
+        .name()
+        .ok()
+        .flatten()
         .unwrap_or_else(|| format!("Logitech device {}", index));
-    let info = transport.device_info()?;
-    let mut features = transport.feature_set()?;
+    let info = transport.device_info().ok().flatten();
+    let mut features = transport.feature_set().unwrap_or_default();
     if features.is_empty() {
         sleep(Duration::from_millis(50));
-        features = transport.feature_set()?;
+        features = transport.feature_set().unwrap_or_default();
     }
     Ok(Some(DeviceDescriptor {
         path: String::new(),
@@ -193,7 +203,7 @@ pub fn snapshot(api: &HidApi, device: &DeviceDescriptor) -> Result<Snapshot> {
     let transport = open(api, device)?;
     let has = |id: u16| device.features.iter().any(|f| f.id == id);
 
-    let battery = if has(0x1000) || has(0x1004) {
+    let battery = if has(0x1000) || has(0x1001) || has(0x1004) {
         transport.battery().ok().flatten().map(battery_view)
     } else {
         None
@@ -242,13 +252,13 @@ pub fn snapshot(api: &HidApi, device: &DeviceDescriptor) -> Result<Snapshot> {
         other => 1000 / (other as u16).max(1),
     });
 
-    let mode_status = if has(0x8071) {
+    let mode_status = if has(0x8090) || has(0x8071) {
         transport.mode_status().ok().flatten()
     } else {
         None
     };
 
-    let dpi = if has(0x2201) || has(0x2110) || has(0x2111) {
+    let dpi = if has(0x8100) || has(0x2201) || has(0x2110) || has(0x2111) {
         transport.onboard_dpi().ok().flatten()
     } else {
         None

@@ -939,6 +939,60 @@ fn spawn_hardware_worker() -> Sender<DeviceAction> {
 // Application State
 // ============================================================================
 
+fn has_missing_configured_devices(devices: &[DeviceDescriptor]) -> bool {
+    if devices.is_empty() {
+        return true;
+    }
+    let Ok(cfg) = config::load() else {
+        return false;
+    };
+    let settings_missing = cfg.device_settings.iter().any(|s| {
+        !s.product_id.is_empty()
+            && !devices
+                .iter()
+                .any(|d| d.product_id.eq_ignore_ascii_case(&s.product_id))
+    });
+    let mappings_missing = cfg.mappings.iter().any(|m| {
+        !m.product_id.is_empty()
+            && !devices
+                .iter()
+                .any(|d| d.product_id.eq_ignore_ascii_case(&m.product_id))
+    });
+    settings_missing || mappings_missing
+}
+
+fn spawn_startup_discovery(
+    ctx: egui::Context,
+    initial_count: usize,
+    sync_on_discover: bool,
+) -> Receiver<(Vec<DeviceDescriptor>, bool)> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut best_count = initial_count;
+        for delay_secs in [2u64, 4, 7, 12, 20] {
+            std::thread::sleep(Duration::from_secs(delay_secs));
+            let Ok(api) = HidApi::new() else {
+                continue;
+            };
+            let Ok(found) = device::discover(&api) else {
+                continue;
+            };
+            if !found.is_empty() && found.len() > best_count {
+                best_count = found.len();
+                let all_present = !has_missing_configured_devices(&found);
+                if tx.send((found, sync_on_discover)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+                if all_present {
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
 struct App {
     api: HidApi,
     devices: Vec<DeviceDescriptor>,
@@ -955,6 +1009,7 @@ struct App {
     action_sender: Sender<DeviceAction>,
     tray: Option<TrayParts>,
     tray_events: Receiver<TrayEvent>,
+    discovery_events: Receiver<(Vec<DeviceDescriptor>, bool)>,
     show_settings_modal: bool,
     autostart_enabled: bool,
     is_quitting: bool,
@@ -978,8 +1033,14 @@ impl App {
     ) -> Self {
         let (sender, tray_events) = mpsc::channel();
         if tray.is_some() {
-            spawn_tray_waker(ctx, sender);
+            spawn_tray_waker(ctx.clone(), sender);
         }
+        let discovery_events = if has_missing_configured_devices(&devices) {
+            spawn_startup_discovery(ctx, devices.len(), start_minimized)
+        } else {
+            let (_tx, rx) = mpsc::channel();
+            rx
+        };
         let action_sender = spawn_hardware_worker();
         let mut app = Self {
             api,
@@ -997,6 +1058,7 @@ impl App {
             action_sender,
             tray,
             tray_events,
+            discovery_events,
             show_settings_modal: false,
             autostart_enabled: crate::autostart::is_enabled(),
             is_quitting: false,
@@ -1008,7 +1070,7 @@ impl App {
             mouse_preset_filter: MousePresetFilter::Keys,
             recording_mouse_button: None,
         };
-        if start_minimized {
+        if start_minimized && !app.devices.is_empty() {
             app.apply_saved();
         }
         app
@@ -1019,6 +1081,13 @@ impl App {
         if self.window_cloaked {
             win32_window::uncloak_and_show_in_taskbar(self.main_hwnd);
             self.window_cloaked = false;
+        }
+        if has_missing_configured_devices(&self.devices) {
+            let prev_len = self.devices.len();
+            self.reload_devices();
+            if self.devices.len() > prev_len {
+                self.apply_saved();
+            }
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -1038,6 +1107,7 @@ impl App {
     }
 
     fn reload_devices(&mut self) {
+        let _ = self.api.refresh_devices();
         match device::discover(&self.api) {
             Ok(devices) => {
                 self.devices = devices;
@@ -1571,7 +1641,12 @@ impl App {
             &format!("Synced {applied_remaps} remap(s) and {applied_settings} hardware setting(s)"),
             false,
         );
-        self.reload_snapshot();
+        if self.window_cloaked {
+            self.snapshot = None;
+            trim_working_set();
+        } else {
+            self.reload_snapshot();
+        }
     }
 }
 
@@ -1712,6 +1787,23 @@ impl eframe::App for App {
                 let raw = [0x80, 0x02, mods, hid_code];
                 let (label, _) = crate::hidpp::parse_mouse_binding(raw);
                 self.set_mouse_button(btn_idx, raw, &label);
+            }
+        }
+
+        while let Ok((discovered, sync_saved)) = self.discovery_events.try_recv() {
+            if !discovered.is_empty() && discovered.len() > self.devices.len() {
+                self.devices = discovered;
+                self.selected = self.selected.min(self.devices.len().saturating_sub(1));
+                self.snapshot = None;
+                if sync_saved {
+                    self.apply_saved();
+                } else {
+                    self.set_status(
+                        &format!("Discovered {} Logitech device(s)", self.devices.len()),
+                        false,
+                    );
+                }
+                trim_working_set();
             }
         }
 
