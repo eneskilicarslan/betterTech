@@ -491,9 +491,10 @@ impl Transport {
         let manual_mode = ((options >> 3) & 0x03) == 0x03;
         let effects = u16::from_le_bytes([reply[3], reply[4]]);
         let level = reply[5];
-        let dho = u16::from_le_bytes([reply[6], reply[7]]);
-        let dhi = u16::from_le_bytes([reply[8], reply[9]]);
-        let dpow = u16::from_le_bytes([reply[10], reply[11]]);
+        // HID++ 0x1982 (Backlight2) stores dho, dhi, dpow in 5-second units.
+        let dho = u16::from_le_bytes([reply[6], reply[7]]).saturating_mul(5);
+        let dhi = u16::from_le_bytes([reply[8], reply[9]]).saturating_mul(5);
+        let dpow = u16::from_le_bytes([reply[10], reply[11]]).saturating_mul(5);
         Ok(Some(BacklightInfo {
             enabled,
             manual_mode,
@@ -518,24 +519,29 @@ impl Transport {
         let Some(index) = self.get_feature(0x1982)? else {
             return Ok(false);
         };
-        // 1. Send effect to function 3
+        // 1. Send permanent effect to function 3
         if effect <= 5 {
             let _ = self.request(index.index(), 0x03, &[effect]);
         }
 
-        // 2. Send full config to function 1
+        // 2. Send full config to function 1 (dho = Hands-Out, dhi = Hands-In, dpow = USB Powered)
+        // Byte 2 must be 0xFF (no temporary effect override) on Backlight2 v3 (MX Mechanical).
+        // Durations in 0x1982 are in 5-second increments (1 = 5s, 6 = 30s, 36 = 180s, 60 = 300s).
         let options = if manual { (0x09 & 0x07) | (0x03 << 3) } else { 0x09 };
-        let dho = duration.min(60);
-        let dpow = duration;
+        let hw_level = if manual { level } else { 0 };
+        let units = duration.div_ceil(5).max(1);
+        let dho = units;
+        let dhi = units;
+        let dpow = units;
         let payload = [
             if enabled { 0x01 } else { 0x00 },
             options,
-            if effect <= 5 { effect } else { 0xFF },
-            level,
+            0xFF,
+            hw_level,
             (dho & 0xFF) as u8,
             (dho >> 8) as u8,
-            0x06,
-            0x00,
+            (dhi & 0xFF) as u8,
+            (dhi >> 8) as u8,
             (dpow & 0xFF) as u8,
             (dpow >> 8) as u8,
         ];
@@ -544,7 +550,14 @@ impl Transport {
     }
 
     pub fn set_backlight(&self, level: u8, manual: bool, enabled: bool) -> Result<bool> {
-        self.set_backlight_full(level, manual, enabled, 0xFF, 30)
+        let duration = self
+            .backlight()
+            .ok()
+            .flatten()
+            .map(|b| b.dpow.max(b.dho))
+            .filter(|&d| d > 0)
+            .unwrap_or(30);
+        self.set_backlight_full(level, manual, enabled, 0xFF, duration)
     }
 
     pub fn set_backlight_effect(&self, effect: u8) -> Result<bool> {
@@ -1321,9 +1334,9 @@ mod tests {
         let manual_mode = ((options >> 3) & 0x03) == 0x03;
         let effects = u16::from_le_bytes([reply[3], reply[4]]);
         let level = reply[5];
-        let dho = u16::from_le_bytes([reply[6], reply[7]]);
-        let dhi = u16::from_le_bytes([reply[8], reply[9]]);
-        let dpow = u16::from_le_bytes([reply[10], reply[11]]);
+        let dho = u16::from_le_bytes([reply[6], reply[7]]).saturating_mul(5);
+        let dhi = u16::from_le_bytes([reply[8], reply[9]]).saturating_mul(5);
+        let dpow = u16::from_le_bytes([reply[10], reply[11]]).saturating_mul(5);
 
         let info = BacklightInfo {
             enabled,
@@ -1340,7 +1353,8 @@ mod tests {
         assert!(info.manual_mode);
         assert_eq!(info.level, 7);
         assert_eq!(info.effects, 0x007F);
-        assert_eq!(info.dho, 6);
-        assert_eq!(info.dpow, 60);
+        assert_eq!(info.dho, 30);
+        assert_eq!(info.dhi, 30);
+        assert_eq!(info.dpow, 300);
     }
 }

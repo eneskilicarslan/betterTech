@@ -780,7 +780,12 @@ fn apply_saved(api: &HidApi, devices: &[device::DeviceDescriptor]) -> Result<()>
                 applied_settings += 1;
             }
         }
-        if let Some(lvl) = settings.backlight_level {
+        if settings.backlight_level.is_some()
+            || settings.backlight_duration.is_some()
+            || settings.backlight_manual.is_some()
+            || settings.backlight_enabled.is_some()
+        {
+            let lvl = settings.backlight_level.unwrap_or(5);
             let effect = settings.backlight_effect.unwrap_or(0xFF);
             let duration = settings.backlight_duration.unwrap_or(30);
             if let Ok(true) = device::set_backlight_full(

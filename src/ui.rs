@@ -963,30 +963,59 @@ fn has_missing_configured_devices(devices: &[DeviceDescriptor]) -> bool {
 
 fn spawn_startup_discovery(
     ctx: egui::Context,
-    initial_count: usize,
-    sync_on_discover: bool,
+    initial_devices: Vec<DeviceDescriptor>,
 ) -> Receiver<(Vec<DeviceDescriptor>, bool)> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut best_count = initial_count;
-        for delay_secs in [2u64, 4, 7, 12, 20] {
-            std::thread::sleep(Duration::from_secs(delay_secs));
+        let mut known_devices = initial_devices;
+        // Only probe on initial startup if no devices responded yet (up to 5 tries).
+        let mut startup_probes_remaining: u8 = if known_devices.is_empty() { 5 } else { 0 };
+        let mut resume_probes_remaining: u8 = 0;
+        let mut last_wall = std::time::SystemTime::now();
+
+        loop {
+            let sleep_secs = if startup_probes_remaining > 0 || resume_probes_remaining > 0 {
+                4
+            } else {
+                5
+            };
+            std::thread::sleep(Duration::from_secs(sleep_secs));
+
+            let now_wall = std::time::SystemTime::now();
+            if let Ok(elapsed) = now_wall.duration_since(last_wall) {
+                if elapsed > Duration::from_secs(sleep_secs + 8) {
+                    // System resumed from Windows Sleep / Hibernate: probe up to 4 times
+                    resume_probes_remaining = 4;
+                }
+            }
+            last_wall = now_wall;
+
+            if startup_probes_remaining == 0 && resume_probes_remaining == 0 {
+                continue;
+            }
+
+            let is_resume = resume_probes_remaining > 0;
+            if startup_probes_remaining > 0 {
+                startup_probes_remaining -= 1;
+            }
+            if resume_probes_remaining > 0 {
+                resume_probes_remaining -= 1;
+            }
+
             let Ok(api) = HidApi::new() else {
                 continue;
             };
             let Ok(found) = device::discover(&api) else {
                 continue;
             };
-            if !found.is_empty() && found.len() > best_count {
-                best_count = found.len();
-                let all_present = !has_missing_configured_devices(&found);
-                if tx.send((found, sync_on_discover)).is_err() {
+            if !found.is_empty() && (is_resume || found.len() > known_devices.len()) {
+                known_devices = found.clone();
+                startup_probes_remaining = 0;
+                resume_probes_remaining = 0;
+                if tx.send((found, true)).is_err() {
                     break;
                 }
                 ctx.request_repaint();
-                if all_present {
-                    break;
-                }
             }
         }
     });
@@ -1035,12 +1064,7 @@ impl App {
         if tray.is_some() {
             spawn_tray_waker(ctx.clone(), sender);
         }
-        let discovery_events = if has_missing_configured_devices(&devices) {
-            spawn_startup_discovery(ctx, devices.len(), start_minimized)
-        } else {
-            let (_tx, rx) = mpsc::channel();
-            rx
-        };
+        let discovery_events = spawn_startup_discovery(ctx, devices.clone());
         let action_sender = spawn_hardware_worker();
         let mut app = Self {
             api,
@@ -1070,7 +1094,7 @@ impl App {
             mouse_preset_filter: MousePresetFilter::Keys,
             recording_mouse_button: None,
         };
-        if start_minimized && !app.devices.is_empty() {
+        if !app.devices.is_empty() {
             app.apply_saved();
         }
         app
@@ -1370,6 +1394,8 @@ impl App {
         self.backlight_duration_secs = duration;
         let (level, manual, enabled, effect) = if let Some(snapshot) = self.snapshot.as_mut() {
             if let Some(b) = snapshot.backlight.as_mut() {
+                b.dho = duration;
+                b.dhi = duration;
                 b.dpow = duration;
                 (b.level, b.manual_mode, b.enabled, b.current_effect)
             } else {
@@ -1379,6 +1405,9 @@ impl App {
             (7, true, true, 0)
         };
         let _ = config::update_device_settings(&descriptor.product_id, &descriptor.unit_id, |s| {
+            s.backlight_level = Some(level);
+            s.backlight_manual = Some(manual);
+            s.backlight_enabled = Some(enabled);
             s.backlight_duration = Some(duration);
         });
         self.set_status(&format!("Backlight sleep timeout set to {duration}s"), false);
@@ -1606,7 +1635,12 @@ impl App {
                     applied_settings += 1;
                 }
             }
-            if let Some(level) = settings.backlight_level {
+            if settings.backlight_level.is_some()
+                || settings.backlight_duration.is_some()
+                || settings.backlight_manual.is_some()
+                || settings.backlight_enabled.is_some()
+            {
+                let level = settings.backlight_level.unwrap_or(5);
                 let effect = settings.backlight_effect.unwrap_or(0xFF);
                 let duration = settings.backlight_duration.unwrap_or(30);
                 if let Ok(true) = device::set_backlight_full(
@@ -1791,7 +1825,7 @@ impl eframe::App for App {
         }
 
         while let Ok((discovered, sync_saved)) = self.discovery_events.try_recv() {
-            if !discovered.is_empty() && discovered.len() > self.devices.len() {
+            if !discovered.is_empty() && (sync_saved || discovered.len() > self.devices.len()) {
                 self.devices = discovered;
                 self.selected = self.selected.min(self.devices.len().saturating_sub(1));
                 self.snapshot = None;
@@ -4094,7 +4128,7 @@ impl App {
 
                                 ui.add_space(6.0);
                                 ui.horizontal(|ui| {
-                                    for preset in [5u16, 10, 30, 60, 120, 300] {
+                                    for preset in [5u16, 10, 30, 60, 120, 180, 300] {
                                         let is_curr = self.backlight_duration_secs == preset;
                                         let label = if preset >= 60 {
                                             format!("{}m", preset / 60)

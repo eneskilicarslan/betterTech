@@ -272,12 +272,39 @@ pub fn snapshot(api: &HidApi, device: &DeviceDescriptor) -> Result<Snapshot> {
 
     if let Some(b) = &mut backlight {
         if let Ok(cfg) = crate::config::load() {
-            if let Some(s) = cfg.device_settings.iter().find(|s| s.product_id == device.product_id && s.unit_id == device.unit_id) {
+            if let Some(s) = cfg.device_settings.iter().find(|s| {
+                s.product_id.eq_ignore_ascii_case(&device.product_id)
+                    && (s.unit_id.is_empty() || s.unit_id.eq_ignore_ascii_case(&device.unit_id))
+            }) {
+                let target_level = s.backlight_level.unwrap_or(b.level);
+                let target_manual = s.backlight_manual.unwrap_or(b.manual_mode);
+                let target_enabled = s.backlight_enabled.unwrap_or(b.enabled);
+                let target_effect = s.backlight_effect.unwrap_or(0xFF);
+                let target_dur = s.backlight_duration.unwrap_or(b.dpow.max(b.dho));
+
+                if b.dho != target_dur
+                    || b.dhi != target_dur
+                    || b.dpow != target_dur
+                    || b.level != target_level
+                    || b.manual_mode != target_manual
+                    || b.enabled != target_enabled
+                {
+                    let _ = transport.set_backlight_full(
+                        target_level,
+                        target_manual,
+                        target_enabled,
+                        target_effect,
+                        target_dur,
+                    );
+                    b.level = target_level;
+                    b.manual_mode = target_manual;
+                    b.enabled = target_enabled;
+                    b.dho = target_dur;
+                    b.dhi = target_dur;
+                    b.dpow = target_dur;
+                }
                 if let Some(eff) = s.backlight_effect {
                     b.current_effect = eff;
-                }
-                if let Some(dur) = s.backlight_duration {
-                    b.dpow = dur;
                 }
             }
         }
