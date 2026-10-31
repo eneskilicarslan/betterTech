@@ -1394,10 +1394,14 @@ impl App {
         self.backlight_duration_secs = duration;
         let (level, manual, enabled, effect) = if let Some(snapshot) = self.snapshot.as_mut() {
             if let Some(b) = snapshot.backlight.as_mut() {
+                if b.level == 0 {
+                    b.level = 5;
+                }
+                b.enabled = true;
                 b.dho = duration;
                 b.dhi = duration;
                 b.dpow = duration;
-                (b.level, b.manual_mode, b.enabled, b.current_effect)
+                (b.level, b.manual_mode, true, b.current_effect)
             } else {
                 (7, true, true, 0)
             }
@@ -1876,16 +1880,42 @@ impl eframe::App for App {
             }
         }
 
-        // Battery saving auto-off enforcement (< 10%)
+        // Battery saving auto-off enforcement (< 10% real battery reading, without overwriting config.json)
         if self.backlight_battery_saving {
-            if let Some(snapshot) = &self.snapshot {
-                if let (Some(battery), Some(backlight)) = (&snapshot.battery, &snapshot.backlight) {
+            let low_battery_action = if let Some(snapshot) = self.snapshot.as_mut() {
+                if let (Some(battery), Some(backlight)) = (&snapshot.battery, snapshot.backlight.as_mut()) {
                     if let Some(level) = battery.level {
-                        if level < 10 && backlight.enabled {
-                            self.set_backlight_level(backlight.level, backlight.manual_mode, false);
-                            self.set_status("Battery low (<10%): Backlight auto-disabled to save power", false);
+                        if level > 0 && level < 10 && backlight.enabled {
+                            backlight.enabled = false;
+                            Some((
+                                backlight.level,
+                                backlight.manual_mode,
+                                backlight.current_effect,
+                                backlight.dpow,
+                            ))
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((lvl, manual, effect, duration)) = low_battery_action {
+                if let Some(descriptor) = self.devices.get(self.selected).cloned() {
+                    let _ = self.action_sender.send(DeviceAction::SetBacklight {
+                        descriptor,
+                        level: lvl,
+                        manual,
+                        enabled: false,
+                        effect,
+                        duration,
+                    });
+                    self.set_status("Battery low (<10%): Backlight auto-disabled to save power", false);
                 }
             }
         }
@@ -3997,10 +4027,16 @@ impl App {
                                     });
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if toggle_switch(ui, backlight.enabled).clicked() {
+                                            let new_enabled = !backlight.enabled;
+                                            let new_level = if new_enabled && backlight.level == 0 {
+                                                5
+                                            } else {
+                                                backlight.level
+                                            };
                                             self.set_backlight_level(
-                                                backlight.level,
+                                                new_level,
                                                 backlight.manual_mode,
-                                                !backlight.enabled,
+                                                new_enabled,
                                             );
                                         }
                                     });
@@ -4028,7 +4064,13 @@ impl App {
                                     });
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if toggle_switch(ui, is_auto).clicked() {
-                                            self.set_backlight_level(backlight.level, is_auto, backlight.enabled);
+                                            let new_manual = is_auto;
+                                            let new_level = if new_manual && backlight.level == 0 {
+                                                5
+                                            } else {
+                                                backlight.level
+                                            };
+                                            self.set_backlight_level(new_level, new_manual, true);
                                         }
                                     });
                                 });
@@ -4066,7 +4108,7 @@ impl App {
                                     .add(egui::Slider::new(&mut lvl, 0..=7).text("Intensity"))
                                     .changed()
                                 {
-                                    self.set_backlight_level(lvl, true, backlight.enabled);
+                                    self.set_backlight_level(lvl, true, lvl > 0);
                                 }
 
                                 ui.add_space(6.0);
@@ -4080,7 +4122,7 @@ impl App {
                                             )
                                             .clicked()
                                         {
-                                            self.set_backlight_level(preset, true, backlight.enabled);
+                                            self.set_backlight_level(preset, true, preset > 0);
                                         }
                                     }
                                 });

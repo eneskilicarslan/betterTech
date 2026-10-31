@@ -918,7 +918,7 @@ impl Battery {
         let level = payload.first().copied()?;
         let status_code = payload.get(2).copied().unwrap_or(0);
         Some(Self {
-            level: Some(level),
+            level: (level > 0).then_some(level),
             status: BatteryStatus::from_code(status_code),
             voltage_mv: None,
         })
@@ -928,7 +928,7 @@ impl Battery {
         let level = payload.first().copied()?;
         let status_code = payload.get(2).copied().unwrap_or(0);
         Some(Self {
-            level: Some(level),
+            level: (level > 0).then_some(level),
             status: BatteryStatus::from_code(status_code),
             voltage_mv: None,
         })
