@@ -443,6 +443,165 @@ pub fn switch_host(api: &HidApi, device: &DeviceDescriptor, host: u8) -> Result<
     transport.switch_host(host)
 }
 
+/// Applies all saved settings and remappings from `config.json` directly to `devices`.
+/// Safe to call from background threads even when the GUI window is hidden in the system tray.
+pub fn enforce_saved_settings(api: &HidApi, devices: &[DeviceDescriptor]) -> usize {
+    let Ok(config) = crate::config::load() else {
+        return 0;
+    };
+    let mut applied = 0usize;
+
+    for mapping in &config.mappings {
+        let Some(desc) = devices.iter().find(|d| {
+            d.product_id.eq_ignore_ascii_case(&mapping.product_id)
+                && (mapping.unit_id.is_empty() || d.unit_id.eq_ignore_ascii_case(&mapping.unit_id))
+        }) else {
+            continue;
+        };
+        if let Ok(true) = set_mapping(api, desc, mapping.from, mapping.to) {
+            applied += 1;
+        }
+    }
+
+    for settings in &config.device_settings {
+        let Some(desc) = devices.iter().find(|d| {
+            d.product_id.eq_ignore_ascii_case(&settings.product_id)
+                && (settings.unit_id.is_empty()
+                    || d.unit_id.eq_ignore_ascii_case(&settings.unit_id))
+        }) else {
+            continue;
+        };
+
+        if let Some(rate) = settings.polling_rate_hz {
+            if let Ok(true) = set_polling_rate(api, desc, rate) {
+                applied += 1;
+            }
+        }
+        if let Some(mode) = settings.power_mode {
+            if let Ok(true) = set_power_mode(api, desc, mode) {
+                applied += 1;
+            }
+        }
+        if let Some(stage) = settings.dpi_stage {
+            if let Ok(true) = set_dpi_stage(api, desc, stage) {
+                applied += 1;
+            }
+        }
+        if let Some(fn_inv) = settings.fn_inverted {
+            if let Ok(true) = set_fn_inversion(api, desc, fn_inv) {
+                applied += 1;
+            }
+        }
+        if settings.backlight_level.is_some()
+            || settings.backlight_duration.is_some()
+            || settings.backlight_manual.is_some()
+            || settings.backlight_enabled.is_some()
+        {
+            let level = settings.backlight_level.unwrap_or(5);
+            let effect = settings.backlight_effect.unwrap_or(0xFF);
+            let duration = settings.backlight_duration.unwrap_or(30);
+            if let Ok(true) = set_backlight_full(
+                api,
+                desc,
+                level,
+                settings.backlight_manual.unwrap_or(false),
+                settings.backlight_enabled.unwrap_or(true),
+                effect,
+                duration,
+            ) {
+                applied += 1;
+            }
+        } else if let Some(effect) = settings.backlight_effect {
+            if let Ok(true) = set_backlight_effect(api, desc, effect) {
+                applied += 1;
+            }
+        }
+        if let Some(mask) = settings.disabled_keys_mask {
+            if let Ok(true) = set_disabled_keys(api, desc, mask) {
+                applied += 1;
+            }
+        }
+        for remap in &settings.mouse_button_remaps {
+            if let Ok(true) = set_mouse_button(api, desc, remap.button_index, remap.raw) {
+                applied += 1;
+            }
+        }
+    }
+
+    applied
+}
+
+/// Checks whether any connected keyboard's volatile `0x1982` (`Backlight2`) registers reverted
+/// to factory defaults (e.g. after wireless sleep) and immediately re-enforces saved settings.
+pub fn verify_and_restore_volatile_settings(api: &HidApi, devices: &[DeviceDescriptor]) -> bool {
+    let Ok(config) = crate::config::load() else {
+        return false;
+    };
+    let mut restored_any = false;
+
+    for settings in &config.device_settings {
+        if settings.backlight_level.is_none()
+            && settings.backlight_duration.is_none()
+            && settings.backlight_manual.is_none()
+            && settings.backlight_enabled.is_none()
+        {
+            continue;
+        }
+        let Some(desc) = devices.iter().find(|d| {
+            d.product_id.eq_ignore_ascii_case(&settings.product_id)
+                && (settings.unit_id.is_empty()
+                    || d.unit_id.eq_ignore_ascii_case(&settings.unit_id))
+        }) else {
+            continue;
+        };
+        let Ok(transport) = open(api, desc) else {
+            continue;
+        };
+        let Ok(Some(b)) = transport.backlight() else {
+            continue;
+        };
+
+        let target_level = settings.backlight_level.unwrap_or(b.level);
+        let target_manual = settings.backlight_manual.unwrap_or(b.manual_mode);
+        let target_enabled = settings.backlight_enabled.unwrap_or(b.enabled);
+        let target_effect = settings.backlight_effect.unwrap_or(0xFF);
+        let target_dur = settings.backlight_duration.unwrap_or(b.dpow.max(b.dho));
+
+        if b.dho != target_dur
+            || b.dhi != target_dur
+            || b.dpow != target_dur
+            || b.level != target_level
+            || b.manual_mode != target_manual
+            || b.enabled != target_enabled
+        {
+            let _ = transport.set_backlight_full(
+                target_level,
+                target_manual,
+                target_enabled,
+                target_effect,
+                target_dur,
+            );
+            if let Some(fn_inv) = settings.fn_inverted {
+                let _ = transport.set_fn_inversion(fn_inv);
+            }
+            if let Some(mask) = settings.disabled_keys_mask {
+                let _ = transport.set_disabled_keys(mask);
+            }
+            for mapping in &config.mappings {
+                if desc.product_id.eq_ignore_ascii_case(&mapping.product_id)
+                    && (mapping.unit_id.is_empty()
+                        || desc.unit_id.eq_ignore_ascii_case(&mapping.unit_id))
+                {
+                    let _ = transport.set_mapping(mapping.from, mapping.to);
+                }
+            }
+            restored_any = true;
+        }
+    }
+
+    restored_any
+}
+
 fn battery_view(battery: Battery) -> BatteryView {
     let status = battery.status.label();
     BatteryView {

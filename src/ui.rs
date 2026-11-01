@@ -57,6 +57,7 @@ mod win32_window {
         fn SetWindowLongPtrW(h_wnd: isize, n_index: i32, dw_new_long: isize) -> isize;
         fn ShowWindow(h_wnd: isize, n_cmd_show: i32) -> i32;
         fn SetForegroundWindow(h_wnd: isize) -> i32;
+        fn GetAsyncKeyState(v_key: i32) -> i16;
     }
 
     #[link(name = "dwmapi")]
@@ -146,6 +147,31 @@ mod win32_window {
             SetForegroundWindow(hwnd);
         }
     }
+
+    pub fn is_any_keyboard_key_down() -> bool {
+        const KEYS: &[i32] = &[
+            0x08, 0x09, 0x0D, 0x10, 0x11, 0x12, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26,
+            0x27, 0x28, 0x2E,
+        ];
+        unsafe {
+            for &vk in KEYS {
+                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
+                    return true;
+                }
+            }
+            for vk in 0x30..=0x5A {
+                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
+                    return true;
+                }
+            }
+            for vk in 0x70..=0x7B {
+                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 #[cfg(not(windows))]
@@ -157,6 +183,9 @@ mod win32_window {
     pub fn uncloak_and_show_in_taskbar(_hwnd: isize) {}
     pub fn force_hide(_hwnd: isize) {}
     pub fn show_and_focus(_hwnd: isize) {}
+    pub fn is_any_keyboard_key_down() -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -961,6 +990,35 @@ fn has_missing_configured_devices(devices: &[DeviceDescriptor]) -> bool {
     settings_missing || mappings_missing
 }
 
+fn has_missing_volatile_devices(devices: &[DeviceDescriptor]) -> bool {
+    if devices.is_empty() {
+        return true;
+    }
+    let Ok(cfg) = config::load() else {
+        return false;
+    };
+    let volatile_missing = cfg.device_settings.iter().any(|s| {
+        let has_volatile = s.backlight_duration.is_some()
+            || s.backlight_level.is_some()
+            || s.backlight_manual.is_some()
+            || s.backlight_enabled.is_some()
+            || s.fn_inverted.is_some()
+            || s.disabled_keys_mask.is_some();
+        has_volatile
+            && !s.product_id.is_empty()
+            && !devices
+                .iter()
+                .any(|d| d.product_id.eq_ignore_ascii_case(&s.product_id))
+    });
+    let mappings_missing = cfg.mappings.iter().any(|m| {
+        !m.product_id.is_empty()
+            && !devices
+                .iter()
+                .any(|d| d.product_id.eq_ignore_ascii_case(&m.product_id))
+    });
+    volatile_missing || mappings_missing
+}
+
 fn spawn_startup_discovery(
     ctx: egui::Context,
     initial_devices: Vec<DeviceDescriptor>,
@@ -968,54 +1026,93 @@ fn spawn_startup_discovery(
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut known_devices = initial_devices;
-        // Only probe on initial startup if no devices responded yet (up to 5 tries).
-        let mut startup_probes_remaining: u8 = if known_devices.is_empty() { 5 } else { 0 };
+        // Probe on startup if any device with volatile RAM settings (e.g. keyboard backlight) is missing
+        let mut startup_probes_remaining: u8 = if has_missing_volatile_devices(&known_devices) {
+            5
+        } else {
+            0
+        };
         let mut resume_probes_remaining: u8 = 0;
+        let mut probe_cooldown_secs: u8 = 3;
+        let mut keyboard_idle_secs: u32 = 0;
+        let mut secs_since_last_verify: u32 = 0;
         let mut last_wall = std::time::SystemTime::now();
 
         loop {
-            let sleep_secs = if startup_probes_remaining > 0 || resume_probes_remaining > 0 {
-                4
-            } else {
-                5
-            };
-            std::thread::sleep(Duration::from_secs(sleep_secs));
+            std::thread::sleep(Duration::from_secs(1));
 
             let now_wall = std::time::SystemTime::now();
             if let Ok(elapsed) = now_wall.duration_since(last_wall) {
-                if elapsed > Duration::from_secs(sleep_secs + 8) {
-                    // System resumed from Windows Sleep / Hibernate: probe up to 4 times
+                if elapsed > Duration::from_secs(9) {
+                    // System resumed from Windows Sleep / Hibernate
                     resume_probes_remaining = 4;
+                    probe_cooldown_secs = 2;
                 }
             }
             last_wall = now_wall;
 
-            if startup_probes_remaining == 0 && resume_probes_remaining == 0 {
-                continue;
+            probe_cooldown_secs = probe_cooldown_secs.saturating_sub(1);
+            secs_since_last_verify = secs_since_last_verify.saturating_add(1);
+
+            let key_down = win32_window::is_any_keyboard_key_down();
+            let was_idle_secs = keyboard_idle_secs;
+            if key_down {
+                keyboard_idle_secs = 0;
+            } else {
+                keyboard_idle_secs = keyboard_idle_secs.saturating_add(1);
             }
 
-            let is_resume = resume_probes_remaining > 0;
-            if startup_probes_remaining > 0 {
-                startup_probes_remaining -= 1;
-            }
-            if resume_probes_remaining > 0 {
-                resume_probes_remaining -= 1;
-            }
+            let missing_volatile = has_missing_volatile_devices(&known_devices);
+            let should_discover = (missing_volatile && key_down && probe_cooldown_secs == 0)
+                || (probe_cooldown_secs == 0
+                    && (startup_probes_remaining > 0 || resume_probes_remaining > 0));
 
-            let Ok(api) = HidApi::new() else {
-                continue;
-            };
-            let Ok(found) = device::discover(&api) else {
-                continue;
-            };
-            if !found.is_empty() && (is_resume || found.len() > known_devices.len()) {
-                known_devices = found.clone();
-                startup_probes_remaining = 0;
-                resume_probes_remaining = 0;
-                if tx.send((found, true)).is_err() {
-                    break;
+            if should_discover {
+                let is_resume = resume_probes_remaining > 0;
+                if startup_probes_remaining > 0 {
+                    startup_probes_remaining -= 1;
                 }
-                ctx.request_repaint();
+                if resume_probes_remaining > 0 {
+                    resume_probes_remaining -= 1;
+                }
+                probe_cooldown_secs = 4;
+
+                let Ok(api) = HidApi::new() else {
+                    continue;
+                };
+                let Ok(found) = device::discover(&api) else {
+                    continue;
+                };
+                if !found.is_empty()
+                    && (is_resume
+                        || found.len() > known_devices.len()
+                        || (missing_volatile && !has_missing_volatile_devices(&found)))
+                {
+                    // Directly enforce saved settings on the background thread so it works
+                    // even when the GUI window is hidden/minimized in the system tray.
+                    let _ = device::enforce_saved_settings(&api, &found);
+                    secs_since_last_verify = 0;
+                    known_devices = found.clone();
+                    if !has_missing_volatile_devices(&known_devices) {
+                        startup_probes_remaining = 0;
+                        resume_probes_remaining = 0;
+                    }
+                    if tx.send((found, true)).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+                continue;
+            }
+
+            // When the user presses a key after the keyboard was idle (>= 15s) or periodically
+            // while gaming/typing (>= 45s), verify that the keyboard's volatile 0x1982 registers
+            // didn't reset to the 15s factory default. Zero HID traffic is sent while idle!
+            if key_down && (was_idle_secs >= 15 || secs_since_last_verify >= 45) {
+                secs_since_last_verify = 0;
+                if let Ok(api) = HidApi::new() {
+                    let _ = device::verify_and_restore_volatile_settings(&api, &known_devices);
+                }
             }
         }
     });
