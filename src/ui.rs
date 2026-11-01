@@ -57,7 +57,6 @@ mod win32_window {
         fn SetWindowLongPtrW(h_wnd: isize, n_index: i32, dw_new_long: isize) -> isize;
         fn ShowWindow(h_wnd: isize, n_cmd_show: i32) -> i32;
         fn SetForegroundWindow(h_wnd: isize) -> i32;
-        fn GetAsyncKeyState(v_key: i32) -> i16;
     }
 
     #[link(name = "dwmapi")]
@@ -147,31 +146,6 @@ mod win32_window {
             SetForegroundWindow(hwnd);
         }
     }
-
-    pub fn is_any_keyboard_key_down() -> bool {
-        const KEYS: &[i32] = &[
-            0x08, 0x09, 0x0D, 0x10, 0x11, 0x12, 0x1B, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26,
-            0x27, 0x28, 0x2E,
-        ];
-        unsafe {
-            for &vk in KEYS {
-                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
-                    return true;
-                }
-            }
-            for vk in 0x30..=0x5A {
-                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
-                    return true;
-                }
-            }
-            for vk in 0x70..=0x7B {
-                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
-                    return true;
-                }
-            }
-        }
-        false
-    }
 }
 
 #[cfg(not(windows))]
@@ -183,9 +157,6 @@ mod win32_window {
     pub fn uncloak_and_show_in_taskbar(_hwnd: isize) {}
     pub fn force_hide(_hwnd: isize) {}
     pub fn show_and_focus(_hwnd: isize) {}
-    pub fn is_any_keyboard_key_down() -> bool {
-        false
-    }
 }
 
 // ============================================================================
@@ -885,12 +856,36 @@ enum DeviceAction {
         descriptor: DeviceDescriptor,
         host: u8,
     },
+    LoadSnapshot {
+        selected_idx: usize,
+        descriptor: DeviceDescriptor,
+    },
+    RescanDevices,
+    SyncSaved {
+        devices: Vec<DeviceDescriptor>,
+    },
 }
 
-fn spawn_hardware_worker() -> Sender<DeviceAction> {
+enum WorkerEvent {
+    SnapshotLoaded {
+        selected_idx: usize,
+        result: std::result::Result<Snapshot, String>,
+    },
+    DevicesDiscovered {
+        devices: Vec<DeviceDescriptor>,
+    },
+    Synced {
+        applied: usize,
+    },
+}
+
+fn spawn_hardware_worker(
+    ctx: egui::Context,
+) -> (Sender<DeviceAction>, Receiver<WorkerEvent>) {
     let (sender, receiver) = mpsc::channel::<DeviceAction>();
+    let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
     std::thread::spawn(move || {
-        let Ok(api) = HidApi::new() else {
+        let Ok(mut api) = HidApi::new() else {
             eprintln!("Hardware worker failed to initialize HidApi");
             return;
         };
@@ -958,10 +953,34 @@ fn spawn_hardware_worker() -> Sender<DeviceAction> {
                 DeviceAction::SwitchHost { descriptor, host } => {
                     let _ = device::switch_host(&api, &descriptor, host);
                 }
+                DeviceAction::LoadSnapshot {
+                    selected_idx,
+                    descriptor,
+                } => {
+                    let result = device::snapshot(&api, &descriptor)
+                        .map_err(|e| format!("Reading {} failed: {e:#}", descriptor.name));
+                    let _ = event_tx.send(WorkerEvent::SnapshotLoaded {
+                        selected_idx,
+                        result,
+                    });
+                    ctx.request_repaint();
+                }
+                DeviceAction::RescanDevices => {
+                    let _ = api.refresh_devices();
+                    if let Ok(devices) = device::discover(&api) {
+                        let _ = event_tx.send(WorkerEvent::DevicesDiscovered { devices });
+                        ctx.request_repaint();
+                    }
+                }
+                DeviceAction::SyncSaved { devices } => {
+                    let applied = device::enforce_saved_settings(&api, &devices);
+                    let _ = event_tx.send(WorkerEvent::Synced { applied });
+                    ctx.request_repaint();
+                }
             }
         }
     });
-    sender
+    (sender, event_rx)
 }
 
 // ============================================================================
@@ -1026,16 +1045,13 @@ fn spawn_startup_discovery(
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut known_devices = initial_devices;
-        // Probe on startup if any device with volatile RAM settings (e.g. keyboard backlight) is missing
-        let mut startup_probes_remaining: u8 = if has_missing_volatile_devices(&known_devices) {
-            5
+        let mut startup_probes_remaining: u8 = if known_devices.is_empty() || has_missing_volatile_devices(&known_devices) {
+            2
         } else {
             0
         };
         let mut resume_probes_remaining: u8 = 0;
-        let mut probe_cooldown_secs: u8 = 3;
-        let mut keyboard_idle_secs: u32 = 0;
-        let mut secs_since_last_verify: u32 = 0;
+        let mut probe_cooldown_secs: u8 = 0; // Probe immediately on start
         let mut last_wall = std::time::SystemTime::now();
 
         loop {
@@ -1045,27 +1061,16 @@ fn spawn_startup_discovery(
             if let Ok(elapsed) = now_wall.duration_since(last_wall) {
                 if elapsed > Duration::from_secs(9) {
                     // System resumed from Windows Sleep / Hibernate
-                    resume_probes_remaining = 4;
-                    probe_cooldown_secs = 2;
+                    resume_probes_remaining = 2;
+                    probe_cooldown_secs = 1;
                 }
             }
             last_wall = now_wall;
 
             probe_cooldown_secs = probe_cooldown_secs.saturating_sub(1);
-            secs_since_last_verify = secs_since_last_verify.saturating_add(1);
 
-            let key_down = win32_window::is_any_keyboard_key_down();
-            let was_idle_secs = keyboard_idle_secs;
-            if key_down {
-                keyboard_idle_secs = 0;
-            } else {
-                keyboard_idle_secs = keyboard_idle_secs.saturating_add(1);
-            }
-
-            let missing_volatile = has_missing_volatile_devices(&known_devices);
-            let should_discover = (missing_volatile && key_down && probe_cooldown_secs == 0)
-                || (probe_cooldown_secs == 0
-                    && (startup_probes_remaining > 0 || resume_probes_remaining > 0));
+            let should_discover = probe_cooldown_secs == 0
+                && (startup_probes_remaining > 0 || resume_probes_remaining > 0);
 
             if should_discover {
                 let is_resume = resume_probes_remaining > 0;
@@ -1075,7 +1080,7 @@ fn spawn_startup_discovery(
                 if resume_probes_remaining > 0 {
                     resume_probes_remaining -= 1;
                 }
-                probe_cooldown_secs = 4;
+                probe_cooldown_secs = 5;
 
                 let Ok(api) = HidApi::new() else {
                     continue;
@@ -1085,33 +1090,20 @@ fn spawn_startup_discovery(
                 };
                 if !found.is_empty()
                     && (is_resume
-                        || found.len() > known_devices.len()
-                        || (missing_volatile && !has_missing_volatile_devices(&found)))
+                        || known_devices.is_empty()
+                        || found.len() > known_devices.len())
                 {
-                    // Directly enforce saved settings on the background thread so it works
-                    // even when the GUI window is hidden/minimized in the system tray.
+                    // Enforce saved settings in the background thread once
                     let _ = device::enforce_saved_settings(&api, &found);
-                    secs_since_last_verify = 0;
                     known_devices = found.clone();
                     if !has_missing_volatile_devices(&known_devices) {
                         startup_probes_remaining = 0;
                         resume_probes_remaining = 0;
                     }
-                    if tx.send((found, true)).is_err() {
+                    if tx.send((found, false)).is_err() {
                         break;
                     }
                     ctx.request_repaint();
-                }
-                continue;
-            }
-
-            // When the user presses a key after the keyboard was idle (>= 15s) or periodically
-            // while gaming/typing (>= 45s), verify that the keyboard's volatile 0x1982 registers
-            // didn't reset to the 15s factory default. Zero HID traffic is sent while idle!
-            if key_down && (was_idle_secs >= 15 || secs_since_last_verify >= 45) {
-                secs_since_last_verify = 0;
-                if let Ok(api) = HidApi::new() {
-                    let _ = device::verify_and_restore_volatile_settings(&api, &known_devices);
                 }
             }
         }
@@ -1120,10 +1112,10 @@ fn spawn_startup_discovery(
 }
 
 struct App {
-    api: HidApi,
     devices: Vec<DeviceDescriptor>,
     selected: usize,
     snapshot: Option<Snapshot>,
+    snapshot_loading: bool,
     status: String,
     status_is_error: bool,
     search_query: String,
@@ -1133,6 +1125,7 @@ struct App {
     backlight_duration_secs: u16,
     backlight_battery_saving: bool,
     action_sender: Sender<DeviceAction>,
+    worker_events: Receiver<WorkerEvent>,
     tray: Option<TrayParts>,
     tray_events: Receiver<TrayEvent>,
     discovery_events: Receiver<(Vec<DeviceDescriptor>, bool)>,
@@ -1150,7 +1143,7 @@ struct App {
 
 impl App {
     fn new(
-        api: HidApi,
+        _api: HidApi,
         devices: Vec<DeviceDescriptor>,
         tray: Option<TrayParts>,
         ctx: egui::Context,
@@ -1161,13 +1154,13 @@ impl App {
         if tray.is_some() {
             spawn_tray_waker(ctx.clone(), sender);
         }
-        let discovery_events = spawn_startup_discovery(ctx, devices.clone());
-        let action_sender = spawn_hardware_worker();
+        let discovery_events = spawn_startup_discovery(ctx.clone(), devices.clone());
+        let (action_sender, worker_events) = spawn_hardware_worker(ctx);
         let mut app = Self {
-            api,
             devices,
             selected: 0,
             snapshot: None,
+            snapshot_loading: false,
             status: "Ready".into(),
             status_is_error: false,
             search_query: String::new(),
@@ -1177,6 +1170,7 @@ impl App {
             backlight_duration_secs: 30,
             backlight_battery_saving: true,
             action_sender,
+            worker_events,
             tray,
             tray_events,
             discovery_events,
@@ -1204,16 +1198,15 @@ impl App {
             self.window_cloaked = false;
         }
         if has_missing_configured_devices(&self.devices) {
-            let prev_len = self.devices.len();
             self.reload_devices();
-            if self.devices.len() > prev_len {
-                self.apply_saved();
-            }
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         win32_window::show_and_focus(self.main_hwnd);
+        if self.snapshot.is_none() && !self.devices.is_empty() {
+            self.reload_snapshot();
+        }
     }
 
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
@@ -1228,81 +1221,79 @@ impl App {
     }
 
     fn reload_devices(&mut self) {
-        let _ = self.api.refresh_devices();
-        match device::discover(&self.api) {
-            Ok(devices) => {
-                self.devices = devices;
-                self.selected = self.selected.min(self.devices.len().saturating_sub(1));
-                self.snapshot = None;
-                self.set_status(&format!("Discovered {} Logitech device(s)", self.devices.len()), false);
-                trim_working_set();
-            }
-            Err(error) => self.set_status(&format!("Discovery failed: {error:#}"), true),
-        }
+        self.set_status("Scanning for Logitech peripherals...", false);
+        let _ = self.action_sender.send(DeviceAction::RescanDevices);
     }
 
     fn reload_snapshot(&mut self) {
         if self.devices.is_empty() {
             self.snapshot = None;
+            self.snapshot_loading = false;
             return;
         }
-        let descriptor = &self.devices[self.selected];
-        match device::snapshot(&self.api, descriptor) {
-            Ok(snapshot) => {
-                let has_mouse_buttons = snapshot.mouse_buttons.is_some();
-                let has_power = snapshot.polling_rate_hz.is_some() || snapshot.mode_status.is_some() || snapshot.dpi.is_some();
-                let has_controls = !snapshot.controls.is_empty();
-                let has_backlight = snapshot.backlight.is_some();
-                let has_kb_settings = snapshot.fn_inverted.is_some() || snapshot.disabled_keys.is_some();
-                let has_hosts = snapshot.hosts.is_some();
+        if let Some(descriptor) = self.devices.get(self.selected).cloned() {
+            self.snapshot_loading = true;
+            let _ = self.action_sender.send(DeviceAction::LoadSnapshot {
+                selected_idx: self.selected,
+                descriptor,
+            });
+        }
+    }
 
-                let tab_valid = match self.current_tab {
-                    DeviceTab::MouseButtons => has_mouse_buttons,
-                    DeviceTab::SensorAndPower => has_power,
-                    DeviceTab::ControlsRemap => has_controls,
-                    DeviceTab::Backlight => has_backlight,
-                    DeviceTab::KeyboardSettings => has_kb_settings,
-                    DeviceTab::EasySwitch => has_hosts,
-                    DeviceTab::Diagnostics => true,
-                };
+    fn update_from_snapshot(&mut self, snapshot: Snapshot) {
+        let has_mouse_buttons = snapshot.mouse_buttons.is_some();
+        let has_power = snapshot.polling_rate_hz.is_some()
+            || snapshot.mode_status.is_some()
+            || snapshot.dpi.is_some();
+        let has_controls = !snapshot.controls.is_empty();
+        let has_backlight = snapshot.backlight.is_some();
+        let has_kb_settings =
+            snapshot.fn_inverted.is_some() || snapshot.disabled_keys.is_some();
+        let has_hosts = snapshot.hosts.is_some();
 
-                if !tab_valid {
-                    if has_mouse_buttons {
-                        self.current_tab = DeviceTab::MouseButtons;
-                    } else if has_controls {
-                        self.current_tab = DeviceTab::ControlsRemap;
-                    } else if has_backlight {
-                        self.current_tab = DeviceTab::Backlight;
-                    } else if has_power {
-                        self.current_tab = DeviceTab::SensorAndPower;
-                    } else {
-                        self.current_tab = DeviceTab::Diagnostics;
-                    }
-                }
+        let tab_valid = match self.current_tab {
+            DeviceTab::MouseButtons => has_mouse_buttons,
+            DeviceTab::SensorAndPower => has_power,
+            DeviceTab::ControlsRemap => has_controls,
+            DeviceTab::Backlight => has_backlight,
+            DeviceTab::KeyboardSettings => has_kb_settings,
+            DeviceTab::EasySwitch => has_hosts,
+            DeviceTab::Diagnostics => true,
+        };
 
-                if let Some(backlight) = &snapshot.backlight {
-                    self.backlight_duration_secs = backlight.dpow;
-                }
-                if let Ok(cfg) = crate::config::load() {
-                    if let Some(s) = cfg.device_settings.iter().find(|s| {
-                        s.product_id == descriptor.product_id && s.unit_id == descriptor.unit_id
-                    }) {
-                        if let Some(saving) = s.backlight_battery_saving {
-                            self.backlight_battery_saving = saving;
-                        }
-                        if let Some(dur) = s.backlight_duration {
-                            self.backlight_duration_secs = dur;
-                        }
-                    }
-                }
-                self.snapshot = Some(snapshot);
-                trim_working_set();
-            }
-            Err(error) => {
-                self.set_status(&format!("Reading {} failed: {error:#}", descriptor.name), true);
-                self.snapshot = None;
+        if !tab_valid {
+            if has_mouse_buttons {
+                self.current_tab = DeviceTab::MouseButtons;
+            } else if has_controls {
+                self.current_tab = DeviceTab::ControlsRemap;
+            } else if has_backlight {
+                self.current_tab = DeviceTab::Backlight;
+            } else if has_power {
+                self.current_tab = DeviceTab::SensorAndPower;
+            } else {
+                self.current_tab = DeviceTab::Diagnostics;
             }
         }
+
+        if let Some(backlight) = &snapshot.backlight {
+            self.backlight_duration_secs = backlight.dpow;
+        }
+        if let Some(descriptor) = self.devices.get(self.selected) {
+            if let Ok(cfg) = crate::config::load() {
+                if let Some(s) = cfg.device_settings.iter().find(|s| {
+                    s.product_id == descriptor.product_id && s.unit_id == descriptor.unit_id
+                }) {
+                    if let Some(saving) = s.backlight_battery_saving {
+                        self.backlight_battery_saving = saving;
+                    }
+                    if let Some(dur) = s.backlight_duration {
+                        self.backlight_duration_secs = dur;
+                    }
+                }
+            }
+        }
+        self.snapshot = Some(snapshot);
+        trim_working_set();
     }
 
     fn apply_mapping(&mut self, from: u16, to: u16) {
@@ -1685,103 +1676,13 @@ impl App {
     }
 
     fn apply_saved(&mut self) {
-        let config = match config::load() {
-            Ok(config) => config,
-            Err(error) => {
-                self.set_status(&format!("Reading config failed: {error:#}"), true);
-                return;
-            }
-        };
-
-        let mut applied_remaps = 0usize;
-        for mapping in &config.mappings {
-            let descriptor = self.devices.iter().find(|device| {
-                device.product_id.eq_ignore_ascii_case(&mapping.product_id)
-                    && (mapping.unit_id.is_empty()
-                        || device.unit_id.eq_ignore_ascii_case(&mapping.unit_id))
-            });
-            if let Some(desc) = descriptor {
-                if let Ok(true) = device::set_mapping(&self.api, desc, mapping.from, mapping.to) {
-                    applied_remaps += 1;
-                }
-            }
+        if self.devices.is_empty() {
+            return;
         }
-
-        let mut applied_settings = 0usize;
-        for settings in &config.device_settings {
-            let descriptor = self.devices.iter().find(|device| {
-                device.product_id.eq_ignore_ascii_case(&settings.product_id)
-                    && (settings.unit_id.is_empty()
-                        || device.unit_id.eq_ignore_ascii_case(&settings.unit_id))
-            });
-            let Some(desc) = descriptor else { continue };
-
-            if let Some(rate) = settings.polling_rate_hz {
-                if let Ok(true) = device::set_polling_rate(&self.api, desc, rate) {
-                    applied_settings += 1;
-                }
-            }
-            if let Some(mode) = settings.power_mode {
-                if let Ok(true) = device::set_power_mode(&self.api, desc, mode) {
-                    applied_settings += 1;
-                }
-            }
-            if let Some(stage) = settings.dpi_stage {
-                if let Ok(true) = device::set_dpi_stage(&self.api, desc, stage) {
-                    applied_settings += 1;
-                }
-            }
-            if let Some(fn_inv) = settings.fn_inverted {
-                if let Ok(true) = device::set_fn_inversion(&self.api, desc, fn_inv) {
-                    applied_settings += 1;
-                }
-            }
-            if settings.backlight_level.is_some()
-                || settings.backlight_duration.is_some()
-                || settings.backlight_manual.is_some()
-                || settings.backlight_enabled.is_some()
-            {
-                let level = settings.backlight_level.unwrap_or(5);
-                let effect = settings.backlight_effect.unwrap_or(0xFF);
-                let duration = settings.backlight_duration.unwrap_or(30);
-                if let Ok(true) = device::set_backlight_full(
-                    &self.api,
-                    desc,
-                    level,
-                    settings.backlight_manual.unwrap_or(false),
-                    settings.backlight_enabled.unwrap_or(true),
-                    effect,
-                    duration,
-                ) {
-                    applied_settings += 1;
-                }
-            } else if let Some(effect) = settings.backlight_effect {
-                if let Ok(true) = device::set_backlight_effect(&self.api, desc, effect) {
-                    applied_settings += 1;
-                }
-            }
-            if let Some(mask) = settings.disabled_keys_mask {
-                if let Ok(true) = device::set_disabled_keys(&self.api, desc, mask) {
-                    applied_settings += 1;
-                }
-            }
-            for remap in &settings.mouse_button_remaps {
-                if let Ok(true) = device::set_mouse_button(&self.api, desc, remap.button_index, remap.raw) {
-                    applied_settings += 1;
-                }
-            }
-        }
-
-        self.set_status(
-            &format!("Synced {applied_remaps} remap(s) and {applied_settings} hardware setting(s)"),
-            false,
-        );
-        if self.window_cloaked {
-            self.snapshot = None;
-            trim_working_set();
-        } else {
-            self.reload_snapshot();
-        }
+        self.set_status("Applying profile settings in background...", false);
+        let _ = self.action_sender.send(DeviceAction::SyncSaved {
+            devices: self.devices.clone(),
+        });
     }
 }
 
@@ -1925,20 +1826,57 @@ impl eframe::App for App {
             }
         }
 
-        while let Ok((discovered, sync_saved)) = self.discovery_events.try_recv() {
-            if !discovered.is_empty() && (sync_saved || discovered.len() > self.devices.len()) {
+        while let Ok((discovered, _)) = self.discovery_events.try_recv() {
+            if !discovered.is_empty() && (self.devices.is_empty() || discovered.len() > self.devices.len()) {
                 self.devices = discovered;
                 self.selected = self.selected.min(self.devices.len().saturating_sub(1));
-                self.snapshot = None;
-                if sync_saved {
-                    self.apply_saved();
+                self.set_status(
+                    &format!("Discovered {} Logitech device(s)", self.devices.len()),
+                    false,
+                );
+                if !self.window_cloaked {
+                    self.reload_snapshot();
                 } else {
-                    self.set_status(
-                        &format!("Discovered {} Logitech device(s)", self.devices.len()),
-                        false,
-                    );
+                    self.snapshot = None;
                 }
                 trim_working_set();
+            }
+        }
+
+        while let Ok(event) = self.worker_events.try_recv() {
+            match event {
+                WorkerEvent::SnapshotLoaded {
+                    selected_idx,
+                    result,
+                } => {
+                    if selected_idx == self.selected {
+                        self.snapshot_loading = false;
+                        match result {
+                            Ok(snapshot) => self.update_from_snapshot(snapshot),
+                            Err(err) => {
+                                self.set_status(&err, true);
+                                self.snapshot = None;
+                            }
+                        }
+                    }
+                }
+                WorkerEvent::DevicesDiscovered { devices } => {
+                    if !devices.is_empty() {
+                        let prev_len = self.devices.len();
+                        self.devices = devices;
+                        self.selected = self.selected.min(self.devices.len().saturating_sub(1));
+                        self.set_status(
+                            &format!("Discovered {} Logitech device(s)", self.devices.len()),
+                            false,
+                        );
+                        if self.devices.len() > prev_len && !self.window_cloaked {
+                            self.reload_snapshot();
+                        }
+                    }
+                }
+                WorkerEvent::Synced { applied } => {
+                    self.set_status(&format!("Synced {applied} profile setting(s) in background"), false);
+                }
             }
         }
 
@@ -2019,7 +1957,7 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.snapshot.is_none() && !self.devices.is_empty() {
+        if self.snapshot.is_none() && !self.devices.is_empty() && !self.snapshot_loading {
             self.reload_snapshot();
         }
 
@@ -2225,7 +2163,9 @@ impl eframe::App for App {
                 if let Some(idx) = clicked_device {
                     self.selected = idx;
                     self.snapshot = None;
+                    self.snapshot_loading = false;
                     self.selected_mouse_button = 0;
+                    self.reload_snapshot();
                 }
 
                 if self.devices.is_empty() {

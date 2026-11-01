@@ -71,17 +71,7 @@ impl Transport {
             .map(Feature))
     }
 
-    pub fn get_feature_with_timeout(
-        &self,
-        feature_id: u16,
-        timeout: Duration,
-    ) -> Result<Option<Feature>> {
-        let reply = self.request_with_timeout(0x00, 0x00, &feature_id.to_be_bytes(), timeout, 2)?;
-        Ok(reply
-            .and_then(|payload| payload.first().copied())
-            .filter(|index| *index != 0)
-            .map(Feature))
-    }
+
 
     pub fn feature_request(
         &self,
@@ -469,6 +459,9 @@ impl Transport {
             return Ok(false);
         };
         let offset = 32 + (button_index as usize * 4);
+        if sector[offset..offset + 4] == raw_binding {
+            return Ok(true);
+        }
         sector[offset..offset + 4].copy_from_slice(&raw_binding);
         let crc = hidpp_crc_ccitt(&sector[..253]);
         sector[253] = (crc >> 8) as u8;
@@ -490,7 +483,20 @@ impl Transport {
         let options = reply[1];
         let manual_mode = ((options >> 3) & 0x03) == 0x03;
         let effects = u16::from_le_bytes([reply[3], reply[4]]);
-        let level = reply[5];
+        let mut level = reply[5];
+        let mut max_level = 7u8;
+        let mut current_effect = 0u8;
+        if let Ok(Some(info)) = self.request(index.index(), 0x02, &[]) {
+            if info.len() >= 4 {
+                if info[0] > 1 {
+                    max_level = info[0] - 1;
+                }
+                if !manual_mode {
+                    level = info[1];
+                }
+                current_effect = info[3];
+            }
+        }
         // HID++ 0x1982 (Backlight2) stores dho, dhi, dpow in 5-second units.
         let dho = u16::from_le_bytes([reply[6], reply[7]]).saturating_mul(5);
         let dhi = u16::from_le_bytes([reply[8], reply[9]]).saturating_mul(5);
@@ -499,8 +505,8 @@ impl Transport {
             enabled,
             manual_mode,
             level,
-            max_level: 7,
-            current_effect: 0,
+            max_level,
+            current_effect,
             effects,
             dho,
             dhi,
@@ -519,33 +525,49 @@ impl Transport {
         let Some(index) = self.get_feature(0x1982)? else {
             return Ok(false);
         };
-        // 1. Send permanent effect to function 3
-        if effect <= 5 {
-            let _ = self.request(index.index(), 0x03, &[effect]);
-        }
+        // Read current config first to preserve low option bits (WOW / CROWN / PWR_SAVE)
+        let current_low_opts = self
+            .request(index.index(), 0x00, &[])
+            .ok()
+            .flatten()
+            .and_then(|r| r.get(1).copied())
+            .map(|o| o & 0x07)
+            .unwrap_or(0x01);
 
-        // 2. Send full config to function 1 (dho = Hands-Out, dhi = Hands-In, dpow = USB Powered)
-        // Byte 2 must be 0xFF (no temporary effect override) on Backlight2 v3 (MX Mechanical).
+        // Send full config to function 1 (dho = Hands-Out, dhi = Hands-In, dpow = Powered, dnpow = Not-Powered)
+        // Byte 2 must be 0xFF (preserve effect) on Backlight2 v3 (MX Mechanical).
         // Durations in 0x1982 are in 5-second increments (1 = 5s, 6 = 30s, 36 = 180s, 60 = 300s).
-        let options = if manual { (0x09 & 0x07) | (0x03 << 3) } else { 0x09 };
+        let mode_bits = if manual { 0x03 << 3 } else { 0x01 << 3 };
+        let options = current_low_opts | mode_bits;
         let hw_level = if manual { level } else { 0 };
         let units = duration.div_ceil(5).max(1);
-        let dho = units;
-        let dhi = units;
-        let dpow = units;
+        let u_lo = (units & 0xFF) as u8;
+        let u_hi = (units >> 8) as u8;
         let payload = [
             if enabled { 0x01 } else { 0x00 },
             options,
             0xFF,
             hw_level,
-            (dho & 0xFF) as u8,
-            (dho >> 8) as u8,
-            (dhi & 0xFF) as u8,
-            (dhi >> 8) as u8,
-            (dpow & 0xFF) as u8,
-            (dpow >> 8) as u8,
+            u_lo,
+            u_hi,
+            u_lo,
+            u_hi,
+            u_lo,
+            u_hi,
+            u_lo,
+            u_hi,
         ];
         let reply = self.request(index.index(), 0x01, &payload)?;
+        if effect <= 6 {
+            let current_eff = self
+                .request(index.index(), 0x02, &[])
+                .ok()
+                .flatten()
+                .and_then(|r| r.get(3).copied());
+            if current_eff != Some(effect) {
+                let _ = self.request(index.index(), 0x03, &[effect]);
+            }
+        }
         Ok(reply.is_some())
     }
 
@@ -800,9 +822,14 @@ impl Transport {
                 && buffer[4] == expected_func_sw
             {
                 let err_code = buffer.get(5).copied().unwrap_or(0);
-                // 0xFF is an explicit HID++ 2.0 feature error; 0x8F with 0x09 (Unknown Device)
-                // or 0x01 (Invalid SubID) means empty receiver slot or non-HID++ 2.0 target.
-                if buffer[2] == HIDPP20_ERROR || err_code == 0x09 || err_code == 0x01 {
+                // 0xFF is an explicit HID++ 2.0 feature error; 0x8F with 0x09 (Unknown Device),
+                // 0x01 (Invalid SubID), or 0x08 (Target Not Active / sleeping wireless device)
+                // means the slot is empty or asleep.
+                if buffer[2] == HIDPP20_ERROR
+                    || err_code == 0x09
+                    || err_code == 0x01
+                    || err_code == 0x08
+                {
                     return Ok(ReplyOutcome::PermanentError);
                 }
                 return Ok(ReplyOutcome::TransientError);

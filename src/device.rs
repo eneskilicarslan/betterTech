@@ -123,14 +123,27 @@ fn scan_path(path: &str) -> Vec<DeviceDescriptor> {
         return Vec::new();
     };
     let mut devices = Vec::new();
-    for index in 1..=6u8 {
+    let path_lower = path.to_ascii_lowercase();
+    let is_usb_receiver = path_lower.contains("pid_c5");
+    // Lightspeed single-device receivers (e.g. G305 0xC53F, 0xC547, 0xC539) only use slot 1.
+    // Multi-device receivers (Bolt 0xC548, Unifying 0xC52B) use slots 1..=6.
+    let max_slot = if path_lower.contains("pid_c53f")
+        || path_lower.contains("pid_c547")
+        || path_lower.contains("pid_c539")
+        || path_lower.contains("pid_c53a")
+    {
+        1u8
+    } else {
+        6u8
+    };
+    for index in 1..=max_slot {
         transport.set_device_index(index);
         if let Ok(Some(mut device)) = probe(&transport, index) {
             device.path = path.to_owned();
             devices.push(device);
         }
     }
-    if devices.is_empty() {
+    if devices.is_empty() && !is_usb_receiver {
         transport.set_device_index(0xff);
         if let Ok(Some(mut device)) = probe(&transport, 0xff) {
             device.path = path.to_owned();
@@ -141,14 +154,8 @@ fn scan_path(path: &str) -> Vec<DeviceDescriptor> {
 }
 
 fn probe(transport: &Transport, index: u8) -> Result<Option<DeviceDescriptor>> {
-    let has_dev_info = transport
-        .get_feature_with_timeout(0x0003, Duration::from_millis(450))?
-        .is_some();
-    if !has_dev_info
-        && transport
-            .get_feature_with_timeout(0x0001, Duration::from_millis(300))?
-            .is_none()
-    {
+    let has_dev_info = transport.get_feature(0x0003)?.is_some();
+    if !has_dev_info {
         return Ok(None);
     }
     let name = transport
@@ -531,76 +538,6 @@ pub fn enforce_saved_settings(api: &HidApi, devices: &[DeviceDescriptor]) -> usi
     applied
 }
 
-/// Checks whether any connected keyboard's volatile `0x1982` (`Backlight2`) registers reverted
-/// to factory defaults (e.g. after wireless sleep) and immediately re-enforces saved settings.
-pub fn verify_and_restore_volatile_settings(api: &HidApi, devices: &[DeviceDescriptor]) -> bool {
-    let Ok(config) = crate::config::load() else {
-        return false;
-    };
-    let mut restored_any = false;
-
-    for settings in &config.device_settings {
-        if settings.backlight_level.is_none()
-            && settings.backlight_duration.is_none()
-            && settings.backlight_manual.is_none()
-            && settings.backlight_enabled.is_none()
-        {
-            continue;
-        }
-        let Some(desc) = devices.iter().find(|d| {
-            d.product_id.eq_ignore_ascii_case(&settings.product_id)
-                && (settings.unit_id.is_empty()
-                    || d.unit_id.eq_ignore_ascii_case(&settings.unit_id))
-        }) else {
-            continue;
-        };
-        let Ok(transport) = open(api, desc) else {
-            continue;
-        };
-        let Ok(Some(b)) = transport.backlight() else {
-            continue;
-        };
-
-        let target_level = settings.backlight_level.unwrap_or(b.level);
-        let target_manual = settings.backlight_manual.unwrap_or(b.manual_mode);
-        let target_enabled = settings.backlight_enabled.unwrap_or(b.enabled);
-        let target_effect = settings.backlight_effect.unwrap_or(0xFF);
-        let target_dur = settings.backlight_duration.unwrap_or(b.dpow.max(b.dho));
-
-        if b.dho != target_dur
-            || b.dhi != target_dur
-            || b.dpow != target_dur
-            || b.level != target_level
-            || b.manual_mode != target_manual
-            || b.enabled != target_enabled
-        {
-            let _ = transport.set_backlight_full(
-                target_level,
-                target_manual,
-                target_enabled,
-                target_effect,
-                target_dur,
-            );
-            if let Some(fn_inv) = settings.fn_inverted {
-                let _ = transport.set_fn_inversion(fn_inv);
-            }
-            if let Some(mask) = settings.disabled_keys_mask {
-                let _ = transport.set_disabled_keys(mask);
-            }
-            for mapping in &config.mappings {
-                if desc.product_id.eq_ignore_ascii_case(&mapping.product_id)
-                    && (mapping.unit_id.is_empty()
-                        || desc.unit_id.eq_ignore_ascii_case(&mapping.unit_id))
-                {
-                    let _ = transport.set_mapping(mapping.from, mapping.to);
-                }
-            }
-            restored_any = true;
-        }
-    }
-
-    restored_any
-}
 
 fn battery_view(battery: Battery) -> BatteryView {
     let status = battery.status.label();

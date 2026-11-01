@@ -199,6 +199,9 @@ fn main() -> Result<()> {
         minimized: top_minimized,
     });
     let api = HidApi::new().context("initializing hidapi")?;
+    if let Command::Gui { minimized } = command {
+        return ui::run(api, Vec::new(), minimized || top_minimized);
+    }
     let devices = device::discover(&api)?;
 
     match command {
